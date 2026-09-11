@@ -1,3 +1,4 @@
+import calendar
 import streamlit as st
 import unicodedata
 import json
@@ -7,6 +8,417 @@ import re
 import zipfile
 import shutil
 import pandas as pd
+
+# V1.4.44 — helpers incorporados ao dashboard; sem módulo externo.
+def _key(value):
+    return "".join(c for c in unicodedata.normalize("NFKD", str(value).casefold())
+                   if not unicodedata.combining(c)).replace("_", " ").strip()
+
+def _col(df, names):
+    lookup = {_key(c): c for c in df.columns}
+    return next((lookup[_key(n)] for n in names if _key(n) in lookup), None)
+
+def _ean(s):
+    return s.astype(str).str.replace(r"\.0$", "", regex=True).str.replace(r"\D", "", regex=True)
+
+def _num(s):
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+    t = s.astype(str).str.replace("R$", "", regex=False).str.strip()
+    both = t.str.contains(",", regex=False) & t.str.contains(".", regex=False)
+    t = t.where(~both, t.str.replace(".", "", regex=False))
+    t = t.str.replace(",", ".", regex=False)
+    return pd.to_numeric(t, errors="coerce")
+
+def _dates(s):
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return pd.to_datetime(s, errors="coerce")
+    t = s.astype(str).str.strip()
+    t = t.str.replace(r"\s+(AMT|AMST|BRT|BRST|GMT(?:[+-]\d+)?|UTC(?:[+-]\d+)?)\s+", " ", regex=True, flags=re.I)
+    dt = pd.to_datetime(t, format="%a %b %d %H:%M:%S %Y", errors="coerce")
+    missing = dt.isna()
+    if missing.any():
+        dt.loc[missing] = pd.to_datetime(t.loc[missing], format="mixed", dayfirst=True, errors="coerce")
+    return dt
+
+def latest_principal(frame, cnpjs):
+    """Only explicitly owned CNPJs; never infer ownership from a competitor name."""
+    empty = pd.DataFrame(columns=["EAN", "Preco_Ultima_Venda", "Data_Ultima_Venda", "Loja_Ultima_Venda", "Arquivo_Ultima_Venda"])
+    if not isinstance(frame, pd.DataFrame) or frame.empty or not cnpjs:
+        return empty
+    ce = _col(frame, ["EAN (GTIN)", "EAN", "GTIN", "Código de Barras"])
+    cp = _col(frame, ["Preço (R$)", "Preco (R$)", "Preço", "Preco"])
+    cd = _col(frame, ["Data Emissão", "Data Emissao", "Data da Pesquisa", "Data Pesquisa"])
+    cc = _col(frame, ["CNPJ", "CNPJ Farmácia", "CNPJ Farmacia"])
+    cl = _col(frame, ["Farmácia", "Farmacia", "Loja", "Nome Fantasia"])
+    if any(x is None for x in [ce,cp,cd,cc]):
+        return empty
+    owned = {re.sub(r"\D", "", str(x)) for x in cnpjs}
+    owned.discard("")
+    b = frame.copy()
+    b = b[b[cc].astype(str).str.replace(r"\D", "", regex=True).isin(owned)].copy()
+    if b.empty:
+        return empty
+    b["EAN"] = _ean(b[ce])
+    b["Preco_Ultima_Venda"] = _num(b[cp])
+    b["Data_Ultima_Venda"] = _dates(b[cd])
+    b["Loja_Ultima_Venda"] = b[cl].fillna("").astype(str) if cl else ""
+    b["Arquivo_Ultima_Venda"] = b["Arquivo_Origem"].astype(str) if "Arquivo_Origem" in b else ""
+    b = b[b["EAN"].ne("") & b["Data_Ultima_Venda"].notna() &
+          b["Preco_Ultima_Venda"].gt(0)].copy()
+    if b.empty:
+        return empty
+    b["_ordem"] = np.arange(len(b))
+    b = b.sort_values(["EAN","Data_Ultima_Venda","_ordem"], kind="stable").groupby("EAN",sort=False).tail(1)
+    return b[empty.columns].reset_index(drop=True)
+
+def read_folder(folder, cnpjs):
+    paths = sorted(list(Path(folder).glob("*.xlsx")) + list(Path(folder).glob("*.xls")))
+    frames = []
+    for path in paths:
+        if path.name.startswith("~$"):
+            continue
+        try:
+            df = pd.read_excel(path, dtype={"CNPJ": str, "EAN (GTIN)": str, "EAN": str})
+            df["Arquivo_Origem"] = path.name
+            frames.append(df)
+        except Exception:
+            continue
+    if not frames:
+        return latest_principal(pd.DataFrame(), cnpjs)
+    return latest_principal(pd.concat(frames, ignore_index=True), cnpjs)
+
+def apply_latest(base, latest, preserve_reference=True):
+    """Overwrite only Principal price fields, preserving market, volume and cost."""
+    if not isinstance(base,pd.DataFrame) or base.empty:
+        return base
+    d=base.copy()
+    ce=_col(d,["EAN","EAN (GTIN)","GTIN"])
+    if ce is None:
+        return d
+    keys=_ean(d[ce])
+    lookup=latest.set_index("EAN") if isinstance(latest,pd.DataFrame) and not latest.empty else pd.DataFrame()
+    price=keys.map(lookup["Preco_Ultima_Venda"]) if not lookup.empty else pd.Series(np.nan,index=d.index)
+    date=keys.map(lookup["Data_Ultima_Venda"]) if not lookup.empty else pd.Series(pd.NaT,index=d.index)
+    if preserve_reference:
+        for target in ["Preco_Atual","Preco_Atual_Venda","Preço Principal","Preco Principal","Preço Atual"]:
+            if target in d.columns and "Preco_Referencia_Calculo" not in d.columns:
+                # Never relabel an unverified existing value as a real sale.
+                d["Preco_Referencia_Calculo"]=np.nan
+    for target in ["Preco_Ultima_Venda","Preco_Atual","Preco_Atual_Venda","Preço Principal","Preco Principal","Preço Atual"]:
+        if target in d.columns or target in ["Preco_Ultima_Venda","Preco_Atual"]:
+            d[target]=price.to_numpy()
+    d["Data_Ultima_Venda"]=date.to_numpy()
+    d["Fonte_Preço_Eirox"]=np.where(price.notna(),"ÚLTIMA VENDA","SEM PESQUISA DO PRINCIPAL")
+    return d
+
+# V1.4.43 — fonte única do Principal: VENDA_TESTE, última Data Emissão.
+from functools import lru_cache as _v143_lru_cache
+
+@_v143_lru_cache(maxsize=12)
+def _v143_cached_latest(signature, cnpjs):
+    return read_folder(Path(__file__).resolve().parent / "VENDA_TESTE", cnpjs)
+
+def eirox_v143_ultima_pesquisa():
+    pasta = Path(__file__).resolve().parent / "VENDA_TESTE"
+    assinatura = tuple(sorted(
+        (p.name, p.stat().st_size, p.stat().st_mtime_ns)
+        for p in list(pasta.glob("*.xlsx")) + list(pasta.glob("*.xls"))
+        if not p.name.startswith("~$")
+    ))
+    # A mesma base pode servir a vários clientes. Nunca compartilhar o mapa
+    # entre CNPJs distintos nem usar o nome da rede para inferir propriedade.
+    cnpjs = tuple(sorted(set(
+        re.sub(r"\D", "", str(x)) for x in eirox_cnpjs_cliente_global()
+    )))
+    return _v143_cached_latest(assinatura, cnpjs).copy()
+
+
+
+
+def eirox_v146_ultimo_mes_fechado():
+    """
+    V1.4.47 — fallback por EAN na VENDA_FINAL_TESTE.
+
+    Para cada EAN:
+      - considera somente competências já fechadas (< mês atual);
+      - localiza a competência MAIS RECENTE em que o produto teve venda válida;
+      - calcula Preço de Venda = Venda / Itens nessa competência;
+      - se o produto não vendeu no mês fechado mais recente da pasta, recua
+        somente para esse EAN até encontrar seu último mês fechado com venda.
+    """
+    pasta = Path(__file__).resolve().parent / "VENDA_FINAL_TESTE"
+    vazio = pd.DataFrame(columns=[
+        "EAN", "Preco_Fallback_Mes_Fechado", "Mes_Fechado_Referencia",
+        "Venda_Mes_Fechado", "Itens_Mes_Fechado"
+    ])
+
+    try:
+        arquivos = [
+            p for p in (
+                list(pasta.glob("*.xlsx")) +
+                list(pasta.glob("*.xls")) +
+                list(pasta.glob("*.csv"))
+            )
+            if not p.name.startswith("~$")
+        ]
+    except Exception:
+        arquivos = []
+
+    if not arquivos:
+        return vazio
+
+    agora = pd.Timestamp.now()
+    mes_atual = int(agora.year * 100 + agora.month)
+
+    linhas = []
+
+    def _competencia_do_arquivo(path, df=None):
+        # Prioridade: a competência informada DENTRO da própria base.
+        # O nome do arquivo é apenas fallback, pois pode não refletir o ano real.
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            cc = _col(df, [
+                "Ano-mês", "Ano-mes", "Ano Mes", "Ano_Mes",
+                "Competência", "Competencia", "Mes", "Mês",
+                "Data Venda", "Data_Venda", "Data"
+            ])
+            if cc is not None:
+                s = df[cc]
+                txt = s.astype(str).str.strip()
+                ext = txt.str.extract(r"(20\d{2})\D*([01]\d)")
+                valid = ext[0].notna() & ext[1].notna()
+                if valid.any():
+                    vals = (
+                        pd.to_numeric(ext.loc[valid,0], errors="coerce") * 100 +
+                        pd.to_numeric(ext.loc[valid,1], errors="coerce")
+                    ).dropna()
+                    if not vals.empty:
+                        return int(vals.max())
+                dt = pd.to_datetime(s, errors="coerce", dayfirst=True, format="mixed")
+                dt = dt.dropna()
+                if not dt.empty:
+                    dmax = dt.max()
+                    return int(dmax.year * 100 + dmax.month)
+
+        # Fallback: YYYYMM / YYYY-MM / YYYY_MM no nome do arquivo.
+        achados = re.findall(
+            r"(?<!\d)(20\d{2})[-_ ]?(0[1-9]|1[0-2])(?!\d)",
+            path.stem
+        )
+        if achados:
+            ano, mes = achados[-1]
+            return int(ano) * 100 + int(mes)
+        return None
+
+    for p in arquivos:
+        try:
+            if p.suffix.lower() == ".csv":
+                try:
+                    df = pd.read_csv(p, sep=None, engine="python", dtype=str, encoding="utf-8-sig")
+                except Exception:
+                    df = pd.read_csv(p, sep=None, engine="python", dtype=str, encoding_errors="ignore")
+            else:
+                df = pd.read_excel(p, dtype=str)
+        except Exception:
+            continue
+
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+
+        competencia = _competencia_do_arquivo(p, df)
+        if competencia is None or competencia >= mes_atual:
+            # Nunca usa mês em aberto.
+            continue
+
+        ce = _col(df, [
+            "EAN", "EAN (GTIN)", "GTIN", "Cód. Barras/Etiq.",
+            "Cod. Barras/Etiq.", "Código de Barras", "Codigo de Barras",
+            "codigobarras"
+        ])
+        cv = _col(df, [
+            "Venda", "Valor Venda", "Faturamento", "Valor Líquido",
+            "Valor Liquido", "Total Venda", "Valor Total"
+        ])
+        cq = _col(df, [
+            "Itens", "Item", "Quantidade", "Qtd", "QTD", "Qtde",
+            "Quantidade Vendida", "Qtd Vendida", "Unidades"
+        ])
+        if ce is None or cv is None or cq is None:
+            continue
+
+        tmp = pd.DataFrame(index=df.index)
+        tmp["EAN"] = _ean(df[ce])
+        tmp["Venda"] = _num(df[cv])
+        tmp["Itens"] = _num(df[cq])
+        tmp["COMPETENCIA"] = int(competencia)
+
+        tmp = tmp[
+            tmp["EAN"].ne("") &
+            tmp["Venda"].notna() &
+            tmp["Itens"].notna() &
+            tmp["Venda"].gt(0) &
+            tmp["Itens"].gt(0)
+        ].copy()
+
+        if not tmp.empty:
+            linhas.append(tmp)
+
+    if not linhas:
+        return vazio
+
+    base = pd.concat(linhas, ignore_index=True)
+
+    # Se houver mais de um arquivo/linha na mesma competência, soma antes.
+    mensal = (
+        base.groupby(["EAN", "COMPETENCIA"], as_index=False)
+        .agg(
+            Venda_Mes_Fechado=("Venda", "sum"),
+            Itens_Mes_Fechado=("Itens", "sum")
+        )
+    )
+
+    mensal = mensal[
+        mensal["Venda_Mes_Fechado"].gt(0) &
+        mensal["Itens_Mes_Fechado"].gt(0)
+    ].copy()
+    if mensal.empty:
+        return vazio
+
+    mensal["Preco_Fallback_Mes_Fechado"] = (
+        mensal["Venda_Mes_Fechado"] /
+        mensal["Itens_Mes_Fechado"].replace(0, np.nan)
+    )
+
+    mensal = mensal[
+        mensal["Preco_Fallback_Mes_Fechado"].notna() &
+        mensal["Preco_Fallback_Mes_Fechado"].gt(0)
+    ].copy()
+    if mensal.empty:
+        return vazio
+
+    # Regra decisiva: último mês fechado COM VENDA de cada EAN.
+    mensal = mensal.sort_values(
+        ["EAN", "COMPETENCIA"],
+        ascending=[True, True],
+        kind="stable"
+    )
+    ult = (
+        mensal.groupby("EAN", as_index=False, sort=False)
+        .tail(1)
+        .copy()
+    )
+
+    ult["Mes_Fechado_Referencia"] = ult["COMPETENCIA"].apply(
+        lambda ym: f"{int(ym)//100:04d}-{int(ym)%100:02d}"
+    )
+
+    return ult[[
+        "EAN",
+        "Preco_Fallback_Mes_Fechado",
+        "Mes_Fechado_Referencia",
+        "Venda_Mes_Fechado",
+        "Itens_Mes_Fechado"
+    ]].reset_index(drop=True)
+
+
+
+def eirox_v146_preco_principal():
+    """
+    Prioridade:
+      1) VENDA_TESTE: última Data Emissão do Principal por EAN.
+      2) Se o EAN não existir ali: VENDA_FINAL_TESTE, último mês fechado,
+         Preço de Venda = Venda / Itens.
+    """
+    pesquisa = eirox_v143_ultima_pesquisa()
+    fechado = eirox_v146_ultimo_mes_fechado()
+
+    eans = set()
+    if isinstance(pesquisa, pd.DataFrame) and not pesquisa.empty:
+        eans.update(pesquisa["EAN"].astype(str))
+    if isinstance(fechado, pd.DataFrame) and not fechado.empty:
+        eans.update(fechado["EAN"].astype(str))
+    if not eans:
+        return pd.DataFrame(columns=[
+            "EAN","Preco_Principal_Final","Fonte_Preco_Principal",
+            "Data_Ultima_Venda","Mes_Fechado_Referencia"
+        ])
+
+    out = pd.DataFrame({"EAN": sorted(eans)})
+    if isinstance(pesquisa, pd.DataFrame) and not pesquisa.empty:
+        p = pesquisa[["EAN","Preco_Ultima_Venda","Data_Ultima_Venda"]].drop_duplicates("EAN", keep="last")
+        out = out.merge(p, on="EAN", how="left")
+    else:
+        out["Preco_Ultima_Venda"] = np.nan
+        out["Data_Ultima_Venda"] = pd.NaT
+
+    if isinstance(fechado, pd.DataFrame) and not fechado.empty:
+        f = fechado.drop_duplicates("EAN", keep="last")
+        out = out.merge(f, on="EAN", how="left")
+    else:
+        out["Preco_Fallback_Mes_Fechado"] = np.nan
+        out["Mes_Fechado_Referencia"] = ""
+
+    real = pd.to_numeric(out["Preco_Ultima_Venda"], errors="coerce")
+    fb = pd.to_numeric(out["Preco_Fallback_Mes_Fechado"], errors="coerce")
+    out["Preco_Principal_Final"] = real.where(real.notna() & real.gt(0), fb)
+    out["Fonte_Preco_Principal"] = np.where(
+        real.notna() & real.gt(0),
+        "ÚLTIMA VENDA",
+        np.where(fb.notna() & fb.gt(0), "ÚLTIMO MÊS FECHADO", "SEM PREÇO")
+    )
+    return out
+
+
+
+def eirox_v143_aplicar_preco(base):
+    """
+    V1.4.47 — Preço Atual:
+    1) VENDA_TESTE pela última Data Emissão do Principal;
+    2) se não houver EAN, VENDA_FINAL_TESTE do último mês fechado,
+       calculando Venda / Itens.
+    """
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return base
+    d = base.copy()
+    ce = _col(d, ["EAN", "EAN (GTIN)", "GTIN"])
+    if ce is None:
+        return d
+
+    mapa = eirox_v146_preco_principal()
+    keys = _ean(d[ce])
+
+    if isinstance(mapa, pd.DataFrame) and not mapa.empty:
+        lk = mapa.drop_duplicates("EAN", keep="last").set_index("EAN")
+        final = keys.map(lk["Preco_Principal_Final"])
+        fonte = keys.map(lk["Fonte_Preco_Principal"])
+        data = keys.map(lk["Data_Ultima_Venda"])
+        mes = keys.map(lk["Mes_Fechado_Referencia"])
+    else:
+        final = pd.Series(np.nan,index=d.index,dtype="float64")
+        fonte = pd.Series("SEM PREÇO",index=d.index,dtype="object")
+        data = pd.Series(pd.NaT,index=d.index)
+        mes = pd.Series("",index=d.index,dtype="object")
+
+    # Mantém referência anterior separada para auditoria/cálculos.
+    ref = pd.Series(np.nan, index=d.index, dtype="float64")
+    for nome in [
+        "Preco_Referencia_Calculo", "Preço Referência Cálculo",
+        "Preco_Atual", "Preço_Atual", "Preço Atual",
+        "Preco_Atual_Venda", "Preço_Atual_Venda"
+    ]:
+        if nome in d.columns:
+            s = pd.to_numeric(d[nome], errors="coerce")
+            ref = ref.where(ref.notna() & (ref > 0), s)
+
+    d["Preco_Referencia_Calculo"] = ref
+    d["Preco_Ultima_Venda"] = pd.to_numeric(final, errors="coerce")
+    d["Data_Ultima_Venda"] = data
+    d["Mes_Fechado_Referencia"] = mes
+    d["Fonte_Preço_Eirox"] = fonte.fillna("SEM PREÇO")
+    return d
+
+
+
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
@@ -24,8 +436,85 @@ from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+
+# ==========================================================
+# EIROX PRICING 2.0 — FASE 8
+# NÚCLEO MULTI-CLIENTE + PERFIL CENTRALIZADO
+# ==========================================================
+EIROX_CORE_VERSION = "2.0.8"
+EIROX_CORE_RULESET_ID = "EIROX-CORE-2.0.8-STRICT-PRICE-V7.1"
+
+EIROX_CLIENT_PROFILES = {
+    "carceres": {
+        "key": "carceres",
+        "brand": "Eirox",
+        "product": "Eirox Pricing Enterprise",
+        "page_title": "Eirox Pricing Enterprise",
+        "logo": "logo eirox.png",
+        "admin_title": "Gestão Eirox",
+        "about_page": "📌 Sobre o Eirox",
+        "excel_brand": "EIROX PRICING ENTERPRISE",
+        "data_dirs": {
+            "historico": "VENDA_TESTE",
+            "venda": "VENDA_FINAL_TESTE",
+            "estoque": "ESTOQUE_TESTE",
+            "compra": "COMPRA_TESTE",
+        },
+    },
+    "insightfarma": {
+        "key": "insightfarma",
+        "brand": "InsightFarma",
+        "product": "InsightFarma Pricing Enterprise",
+        "page_title": "InsightFarma Pricing Enterprise",
+        "logo": "logo insightfarma.png",
+        "admin_title": "Gestão InsightFarma",
+        "about_page": "📌 Sobre a InsightFarma",
+        "excel_brand": "INSIGHTFARMA PRICING ENTERPRISE",
+        "data_dirs": {
+            "historico": "VENDA_TESTE",
+            "venda": "VENDA_FINAL_TESTE",
+            "estoque": "ESTOQUE_TESTE",
+            "compra": "COMPRA_TESTE",
+        },
+    },
+}
+
+EIROX_CLIENT_KEY = "insightfarma"
+EIROX_CLIENT_PROFILE = EIROX_CLIENT_PROFILES[EIROX_CLIENT_KEY]
+
+
+def eirox_v280_profile():
+    """Fonte única de branding/configuração do cliente neste deploy standalone."""
+    return EIROX_CLIENT_PROFILE
+
+
+def eirox_v280_core_signature():
+    payload = {
+        "core": EIROX_CORE_VERSION,
+        "ruleset": EIROX_CORE_RULESET_ID,
+        "client": EIROX_CLIENT_PROFILE["key"],
+        "data_dirs": EIROX_CLIENT_PROFILE["data_dirs"],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def eirox_v280_core_manifest():
+    return {
+        "Núcleo": EIROX_CORE_VERSION,
+        "Ruleset": EIROX_CORE_RULESET_ID,
+        "Cliente": EIROX_CLIENT_PROFILE["key"],
+        "Produto": EIROX_CLIENT_PROFILE["product"],
+        "Preço Atual": "VENDA_TESTE Principal → VENDA_FINAL_TESTE último mês fechado",
+        "Custo": "ESTOQUE_TESTE → VENDA_FINAL_TESTE",
+        "Mercado": "VENDA_TESTE concorrente, ocorrência atômica",
+        "Volume": "VENDA_FINAL_TESTE, último mês fechado por EAN",
+    }
+
+
 st.set_page_config(
-    page_title="InsightFarma Pricing Enterprise",
+    page_title=EIROX_CLIENT_PROFILE["page_title"],
     layout="wide"
 )
 
@@ -901,8 +1390,7 @@ def garantir_colunas_padrao_dashboard(df_base):
         df_base = df_base.copy()
 
         padroes = {
-            "Família": "Não informado",
-            "Familia": "Não informado",
+                "Familia": "Não informado",
             "CURVA": "Não informado",
             "Recomendacao": "MANTER",
             "Laboratório": "Não informado",
@@ -939,7 +1427,60 @@ def garantir_colunas_padrao_dashboard(df_base):
         return df_base
 
 
-def construir_base_pricing_somente_pastas(historico, compra, venda_rede, estoque):
+
+
+def eirox_ultima_venda_por_ean(venda, ean_col, qtd_col=None, preco_col=None, valor_total_col=None):
+    """Última venda transacional válida; nunca usa média ou fechamento mensal."""
+    cols = ["EAN", "Preco_Ultima_Venda", "Data_Ultima_Venda"]
+    vazio = pd.DataFrame(columns=cols)
+    if not isinstance(venda, pd.DataFrame) or venda.empty or ean_col not in venda.columns:
+        return vazio
+    import unicodedata
+    def norm(x):
+        return "".join(ch for ch in unicodedata.normalize("NFKD", str(x).casefold())
+                       if not unicodedata.combining(ch)).replace("_", " ").strip()
+    mapa = {norm(k): k for k in venda.columns}
+    def achar(nomes):
+        return next((mapa[norm(n)] for n in nomes if norm(n) in mapa), None)
+    data_col = achar(["Data Hora Venda", "Data/Hora Venda", "DataHoraVenda",
+                      "Data da Venda", "Data Venda", "Data_Venda",
+                      "DataHoraFechamento", "Data Hora Fechamento",
+                      "DataHoraMovimento", "Data Hora Movimento",
+                      "DataHora", "Data Hora", "Data_Hora"])
+    # Data de pesquisa, emissão fiscal e competência mensal não são timestamps
+    # de venda. Não inferir a última transação a partir deles.
+    if data_col is None:
+        return vazio
+    preco_real = achar(["Preco Unitario Liquido", "Preço Unitário Líquido",
+                        "Valor Unitario Liquido", "Valor Unitário Líquido",
+                        "Preco Liquido Unitario", "Preço Líquido Unitário",
+                        "Preco Venda Liquido", "Preço Venda Líquido",
+                        "Preco_Unitario_Efetivo", "Preco_Unitario_Liquido",
+                        "Preco_Unitario", "Preço Unitário", "Preco Unitario",
+                        "Valor Unitário", "Valor Unitario", "Preço Venda",
+                        "Preco Venda", "Preço (R$)", "Preco (R$)"])
+    if preco_real is None:
+        return vazio
+    v = venda.copy()
+    v["EAN"] = v[ean_col].astype(str).str.replace(r"\\.0$", "", regex=True).str.replace(r"\\D", "", regex=True)
+    v["_ORDEM_ULT_VENDA"] = range(len(v))
+    s = v[data_col].astype(str).str.strip()
+    s = s.str.replace(r"\\s+(AMT|AMST|BRT|BRST|GMT(?:[+-]\\d+)?|UTC(?:[+-]\\d+)?)\\s+", " ", regex=True, flags=re.IGNORECASE)
+    v["_DATA_ULT_VENDA"] = pd.to_datetime(s, errors="coerce", dayfirst=True, format="mixed")
+    v["_PRECO_UNIT_ULT_VENDA"] = converter_numero_brasil(v[preco_real])
+    # A última venda é escolhida ANTES de verificar o preço. Uma ocorrência
+    # recente sem preço não pode ser substituída silenciosamente por outra antiga.
+    v = v[v["EAN"].ne("") & v["_DATA_ULT_VENDA"].notna()].copy()
+    if v.empty:
+        return vazio
+    v = v.sort_values(["EAN", "_DATA_ULT_VENDA", "_ORDEM_ULT_VENDA"], kind="stable").groupby("EAN", dropna=False).tail(1)
+    v["_PRECO_UNIT_ULT_VENDA"] = v["_PRECO_UNIT_ULT_VENDA"].where(v["_PRECO_UNIT_ULT_VENDA"].gt(0))
+    return v[["EAN", "_PRECO_UNIT_ULT_VENDA", "_DATA_ULT_VENDA"]].rename(columns={
+        "_PRECO_UNIT_ULT_VENDA": "Preco_Ultima_Venda",
+        "_DATA_ULT_VENDA": "Data_Ultima_Venda"
+    }).reset_index(drop=True)
+
+def _v143_original_construir_base_pricing_somente_pastas(historico, compra, venda_rede, estoque):
     try:
         h = historico.copy() if isinstance(historico, pd.DataFrame) else pd.DataFrame()
         c = compra.copy() if isinstance(compra, pd.DataFrame) else pd.DataFrame()
@@ -996,7 +1537,7 @@ def construir_base_pricing_somente_pastas(historico, compra, venda_rede, estoque
 
         if not v.empty:
             col_ean_v = _achar_coluna_eirox(v, ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras", "Codigo de Barras"], ["ean", "gtin", "barras"])
-            col_qtd_v = _achar_coluna_eirox(v, ["Quantidade", "Qtd", "Qtde", "QTD_VENDIDA", "Qtd Vendida"], ["quant", "qtd", "qtde"])
+            col_qtd_v = _achar_coluna_eirox(v, ["Itens", "Item", "Quantidade", "Qtd", "Qtde", "QTD_VENDIDA", "Qtd Vendida", "Unidades"], ["itens", "item", "quant", "qtd", "qtde", "unid"])
             col_val_v = _achar_coluna_eirox(v, ["Valor", "Valor Total", "Valor_Liquido", "Venda", "Venda Preço Antigo"], ["valor", "liquido", "líquido", "venda"])
             col_preco_v = _achar_coluna_eirox(v, ["Preço", "Preco", "Valor Unitario", "Valor Unitário", "valorunitario"], ["preço", "preco", "unit"])
 
@@ -1004,13 +1545,21 @@ def construir_base_pricing_somente_pastas(historico, compra, venda_rede, estoque
             tmp["EAN"] = v[col_ean_v].apply(_normalizar_ean_eirox) if col_ean_v else ""
             tmp["Qtd_Vendida_Mes_Anterior"] = v[col_qtd_v].apply(_numero_br_para_float_eirox) if col_qtd_v else 0
             tmp["Venda_Preco_Antigo"] = v[col_val_v].apply(_numero_br_para_float_eirox) if col_val_v else np.nan
-            tmp["Preco_Atual_Venda"] = v[col_preco_v].apply(_numero_br_para_float_eirox) if col_preco_v else np.nan
 
             vend = tmp.groupby("EAN", as_index=False).agg(
                 Qtd_Vendida_Mes_Anterior=("Qtd_Vendida_Mes_Anterior", "sum"),
-                Venda_Preco_Antigo=("Venda_Preco_Antigo", "sum"),
-                Preco_Atual_Venda=("Preco_Atual_Venda", "mean")
+                Venda_Preco_Antigo=("Venda_Preco_Antigo", "sum")
             )
+            # V1.4.38: preço atual nunca é média; é a última venda por data/hora.
+            _ult = eirox_ultima_venda_por_ean(
+                v, col_ean_v, qtd_col=col_qtd_v, preco_col=col_preco_v,
+                valor_total_col=col_val_v
+            )
+            if not _ult.empty:
+                vend = vend.merge(_ult[["EAN", "Preco_Ultima_Venda"]], on="EAN", how="left")
+                vend = vend.rename(columns={"Preco_Ultima_Venda": "Preco_Atual_Venda"})
+            else:
+                vend["Preco_Atual_Venda"] = np.nan
             agg = agg.merge(vend, on="EAN", how="left")
 
         if not c.empty:
@@ -1045,8 +1594,16 @@ def construir_base_pricing_somente_pastas(historico, compra, venda_rede, estoque
             )
             agg = agg.merge(est, on="EAN", how="left")
 
+        # Preço Atual = somente última venda transacional.
         agg["Preco_Atual"] = agg["Preco_Atual_Venda"] if "Preco_Atual_Venda" in agg.columns else np.nan
-        agg["Preco_Atual"] = agg["Preco_Atual"].fillna(agg["Preco_Medio"])
+        # Referência mensal preserva o motor quando a fonte ainda não possui
+        # venda transacional; nunca substitui ou é exibida como Preço Atual.
+        if "Venda_Preco_Antigo" in agg.columns and "Qtd_Vendida_Mes_Anterior" in agg.columns:
+            _q_ref = pd.to_numeric(agg["Qtd_Vendida_Mes_Anterior"], errors="coerce").replace(0, np.nan)
+            _v_ref = pd.to_numeric(agg["Venda_Preco_Antigo"], errors="coerce")
+            agg["Preco_Referencia_Calculo"] = (_v_ref / _q_ref).where((_v_ref > 0) & (_q_ref > 0))
+        else:
+            agg["Preco_Referencia_Calculo"] = np.nan
 
         if "Custo" not in agg.columns:
             agg["Custo"] = np.nan
@@ -1095,6 +1652,16 @@ def construir_base_pricing_somente_pastas(historico, compra, venda_rede, estoque
 
 
 
+def construir_base_pricing_somente_pastas(historico, compra, venda_rede, estoque):
+    d = _v143_original_construir_base_pricing_somente_pastas(
+        historico, compra, venda_rede, estoque
+    )
+    return eirox_v143_aplicar_preco(d)
+
+
+
+
+
 
 try:
     if not st.session_state.get("cache_limpo_motor_corrigido_v1421", False):
@@ -1133,7 +1700,6 @@ pio.templates.default = "plotly_dark"
 # --------------------------------------------------
 
 ARQUIVO_CADASTRO_CNPJ_CLIENTE = Path("CADASTRO_CLIENTE_CNPJ.csv")
-
 
 def normalizar_cnpj_eirox(valor):
     try:
@@ -2128,49 +2694,91 @@ def eirox_txt(v, padrao="Não informado"):
 
 def eirox_mapa_auxiliar_produto(compra_base=None, estoque_base=None):
     """
-    Monta mapa por EAN com Laboratório, Família, CURVA e Custo.
-    Usa COMPRA_TESTE e ESTOQUE_TESTE mesmo quando o cabeçalho veio deslocado.
+    V1.4.66 — mapa auxiliar somente cadastral.
+
+    Laboratório, Família e CURVA podem vir de COMPRA_TESTE/ESTOQUE_TESTE.
+    Custo NÃO é preenchido aqui: a única fonte de custo do Pricing é
+    aplicar_custo_oficial_estoque_teste().
     """
     try:
         fontes = []
         for base in [compra_base, estoque_base]:
             if isinstance(base, pd.DataFrame) and not base.empty:
                 aux = eirox_normalizar_colunas_planilha(base.copy())
-                col_ean = eirox_coluna(aux, ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras", "Codigo de Barras", "codigobarras", "Cod Barras", "Barras"])
+                col_ean = eirox_coluna(
+                    aux,
+                    ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras",
+                     "Codigo de Barras", "codigobarras", "Cod Barras", "Barras"]
+                )
                 if not col_ean:
                     continue
 
-                col_lab = eirox_coluna(aux, ["Laboratório", "Laboratorio", "LABORATORIO", "Fabricante", "FABRICANTE", "Marca", "MARCA"])
-                col_fam = eirox_coluna(aux, ["Família", "Familia", "FAMILIA", "Classificação", "Classificacao", "Categoria", "Grupo", "Departamento", "Classe"])
-                col_curva = eirox_coluna(aux, ["CURVA", "Curva", "Curva ABC", "ABC"])
-                col_custo = eirox_coluna(aux, ["Custo", "Custo Unitário", "Custo_Unitario", "Preço Compra", "Preco Compra", "Custo Medio", "Custo Médio"])
+                col_lab = eirox_coluna(
+                    aux,
+                    ["Laboratório", "Laboratorio", "LABORATORIO",
+                     "Fabricante", "FABRICANTE", "Marca", "MARCA"]
+                )
+                col_fam = eirox_coluna(
+                    aux,
+                    ["Família", "Familia", "FAMILIA", "Classificação",
+                     "Classificacao", "Categoria", "Grupo", "Departamento", "Classe"]
+                )
+                col_curva = eirox_coluna(
+                    aux, ["CURVA", "Curva", "Curva ABC", "ABC"]
+                )
 
                 tmp = pd.DataFrame()
                 tmp["EAN_JOIN"] = aux[col_ean].apply(eirox_norm_ean)
-                if col_lab: tmp["Laboratório_aux"] = aux[col_lab].apply(lambda x: eirox_txt(x, ""))
-                if col_fam: tmp["Família_aux"] = aux[col_fam].apply(lambda x: eirox_txt(x, ""))
-                if col_curva: tmp["CURVA_aux"] = aux[col_curva].apply(lambda x: eirox_txt(x, ""))
-                if col_custo: tmp["Custo_aux"] = pd.to_numeric(aux[col_custo].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False), errors="coerce")
+                if col_lab:
+                    tmp["Laboratório_aux"] = aux[col_lab].apply(
+                        lambda x: eirox_txt(x, "")
+                    )
+                if col_fam:
+                    tmp["Família_aux"] = aux[col_fam].apply(
+                        lambda x: eirox_txt(x, "")
+                    )
+                if col_curva:
+                    tmp["CURVA_aux"] = aux[col_curva].apply(
+                        lambda x: eirox_txt(x, "")
+                    )
 
                 tmp = tmp[tmp["EAN_JOIN"].astype(str).str.len() > 0].copy()
                 if not tmp.empty:
                     fontes.append(tmp)
 
         if not fontes:
-            return pd.DataFrame(columns=["EAN_JOIN", "Laboratório_aux", "Família_aux", "CURVA_aux", "Custo_aux"])
+            return pd.DataFrame(
+                columns=["EAN_JOIN", "Laboratório_aux", "Família_aux", "CURVA_aux"]
+            )
 
         full = pd.concat(fontes, ignore_index=True, sort=False)
 
         agg = {}
         for c in ["Laboratório_aux", "Família_aux", "CURVA_aux"]:
             if c in full.columns:
-                agg[c] = lambda x: next((str(v).strip() for v in x if str(v).strip() and str(v).strip().lower() not in ["nan", "none", "null", "não informado", "nao informado"]), "")
-        if "Custo_aux" in full.columns:
-            agg["Custo_aux"] = "mean"
+                agg[c] = lambda x: next(
+                    (
+                        str(v).strip()
+                        for v in x
+                        if str(v).strip()
+                        and str(v).strip().lower()
+                        not in ["nan", "none", "null", "não informado", "nao informado"]
+                    ),
+                    ""
+                )
+
+        if not agg:
+            return pd.DataFrame(
+                columns=["EAN_JOIN", "Laboratório_aux", "Família_aux", "CURVA_aux"]
+            )
 
         return full.groupby("EAN_JOIN", as_index=False).agg(agg)
+
     except Exception:
-        return pd.DataFrame(columns=["EAN_JOIN", "Laboratório_aux", "Família_aux", "CURVA_aux", "Custo_aux"])
+        return pd.DataFrame(
+            columns=["EAN_JOIN", "Laboratório_aux", "Família_aux", "CURVA_aux"]
+        )
+
 
 
 def corrigir_pipeline_lab_familia_recomendacoes(df_base, compra_base=None, estoque_base=None):
@@ -2219,9 +2827,8 @@ def corrigir_pipeline_lab_familia_recomendacoes(df_base, compra_base=None, estoq
                 novo = df["CURVA_aux"].apply(lambda x: eirox_txt(x, ""))
                 df["CURVA"] = np.where(atual.eq(""), novo, atual)
 
-            if "Custo_aux" in df.columns:
-                custo_atual = pd.to_numeric(df["Custo"], errors="coerce")
-                df["Custo"] = custo_atual.fillna(df["Custo_aux"])
+            # V1.4.66: custo não recebe fallback cadastral/compra.
+            # A fonte única é ESTOQUE_TESTE por Custo Médio / Estoque.
 
         # Fallback por descrição para família quando ainda faltar.
         if "Produto" in df.columns:
@@ -2642,94 +3249,415 @@ def eirox_numero_br_para_float(v):
 
 def mapa_custo_unitario_estoque_teste(estoque_base):
     """
-    Custo oficial:
-    Custo Unitário = coluna 'Custo Médio' / coluna 'Estoque'
-    agrupado por EAN.
+    V1.4.66 — mapa oficial e auditável de custo por EAN.
+
+    Fonte única:
+        Custo Unitário Oficial = soma(Custo Médio) / soma(Estoque)
+
+    O mapa mantém também EANs sem custo calculável para explicar o motivo:
+    EAN não encontrado, estoque zerado/negativo ou custo médio ausente.
     """
+    colunas_saida = [
+        "EAN_JOIN_CUSTO",
+        "Custo_Estoque_Unitario",
+        "Custo_Medio_Total_Base",
+        "Estoque_Total_Base",
+        "Fonte_Custo_Oficial",
+        "Motivo_Sem_Custo",
+    ]
     try:
         if not isinstance(estoque_base, pd.DataFrame) or estoque_base.empty:
-            return pd.DataFrame(columns=["EAN_JOIN_CUSTO", "Custo_Estoque_Unitario"])
+            return pd.DataFrame(columns=colunas_saida)
 
         est = estoque_base.copy()
 
-        col_ean = eirox_coluna_generica(est, ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras", "Codigo de Barras", "codigobarras", "Barras"])
-        col_custo_medio = eirox_coluna_generica(est, ["Custo Médio", "Custo Medio", "Custo_Medio", "Custo Médio Total", "Custo Medio Total"])
-        col_estoque = eirox_coluna_generica(est, ["Estoque", "Qtd Estoque", "Quantidade Estoque", "Qtd_Estoque"])
+        col_ean = eirox_coluna_generica(
+            est,
+            ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras", "Codigo de Barras",
+             "codigobarras", "Barras", "Código Barras", "Codigo Barras"]
+        )
+        col_custo_medio = eirox_coluna_generica(
+            est,
+            ["Custo Médio", "Custo Medio", "Custo_Medio",
+             "Custo Médio Total", "Custo Medio Total", "Custo_Medio_Total"]
+        )
+        col_estoque = eirox_coluna_generica(
+            est,
+            ["Estoque", "Qtd Estoque", "Quantidade Estoque", "Qtd_Estoque",
+             "Estoque Atual", "Quantidade em Estoque"]
+        )
 
-        if not col_ean or not col_custo_medio or not col_estoque:
-            return pd.DataFrame(columns=["EAN_JOIN_CUSTO", "Custo_Estoque_Unitario"])
+        if not col_ean:
+            return pd.DataFrame(columns=colunas_saida)
 
-        est["EAN_JOIN_CUSTO"] = est[col_ean].apply(lambda x: re.sub(r"\D", "", str(x).replace(".0", "")))
-        est["_CUSTO_MEDIO_TOTAL"] = est[col_custo_medio].apply(eirox_numero_br_para_float)
-        est["_ESTOQUE_QTD"] = est[col_estoque].apply(eirox_numero_br_para_float)
-
-        est = est[
-            est["EAN_JOIN_CUSTO"].astype(str).str.len().gt(0)
-            & est["_ESTOQUE_QTD"].fillna(0).gt(0)
-        ].copy()
-
+        est["EAN_JOIN_CUSTO"] = est[col_ean].apply(
+            lambda x: re.sub(r"\D", "", str(x).replace(".0", ""))
+        )
+        est = est[est["EAN_JOIN_CUSTO"].astype(str).str.len().gt(0)].copy()
         if est.empty:
-            return pd.DataFrame(columns=["EAN_JOIN_CUSTO", "Custo_Estoque_Unitario"])
+            return pd.DataFrame(columns=colunas_saida)
 
-        # Soma custo médio total e estoque por EAN, depois divide.
+        if col_custo_medio:
+            est["_CUSTO_MEDIO_TOTAL"] = est[col_custo_medio].apply(
+                eirox_numero_br_para_float
+            )
+        else:
+            est["_CUSTO_MEDIO_TOTAL"] = np.nan
+
+        if col_estoque:
+            est["_ESTOQUE_QTD"] = est[col_estoque].apply(
+                eirox_numero_br_para_float
+            )
+        else:
+            est["_ESTOQUE_QTD"] = np.nan
+
+        # Agrega primeiro por EAN. Não descarta silenciosamente EAN com estoque zero:
+        # eles continuam no diagnóstico com o motivo explícito.
         agg = est.groupby("EAN_JOIN_CUSTO", as_index=False).agg(
-            Custo_Medio_Total=("_CUSTO_MEDIO_TOTAL", "sum"),
-            Estoque_Total=("_ESTOQUE_QTD", "sum")
-        )
-        agg["Custo_Estoque_Unitario"] = np.where(
-            agg["Estoque_Total"] > 0,
-            agg["Custo_Medio_Total"] / agg["Estoque_Total"],
-            np.nan
+            Custo_Medio_Total_Base=("_CUSTO_MEDIO_TOTAL", "sum"),
+            Estoque_Total_Base=("_ESTOQUE_QTD", "sum"),
+            Linhas_Estoque=("_ESTOQUE_QTD", "size"),
+            Linhas_Custo_Validas=("_CUSTO_MEDIO_TOTAL", lambda s: int(pd.to_numeric(s, errors="coerce").notna().sum())),
+            Linhas_Estoque_Validas=("_ESTOQUE_QTD", lambda s: int(pd.to_numeric(s, errors="coerce").notna().sum())),
         )
 
-        return agg[["EAN_JOIN_CUSTO", "Custo_Estoque_Unitario"]]
+        custo_total = pd.to_numeric(
+            agg["Custo_Medio_Total_Base"], errors="coerce"
+        )
+        estoque_total = pd.to_numeric(
+            agg["Estoque_Total_Base"], errors="coerce"
+        )
+
+        custo_unit = pd.Series(np.nan, index=agg.index, dtype="float64")
+        ok = (
+            agg["Linhas_Custo_Validas"].gt(0)
+            & agg["Linhas_Estoque_Validas"].gt(0)
+            & custo_total.notna()
+            & custo_total.gt(0)
+            & estoque_total.notna()
+            & estoque_total.gt(0)
+        )
+        custo_unit.loc[ok] = (
+            custo_total.loc[ok] / estoque_total.loc[ok]
+        )
+
+        agg["Custo_Estoque_Unitario"] = custo_unit
+        agg["Fonte_Custo_Oficial"] = np.where(
+            custo_unit.notna() & custo_unit.gt(0),
+            "ESTOQUE_TESTE — CUSTO MÉDIO / ESTOQUE",
+            ""
+        )
+
+        motivo = pd.Series("", index=agg.index, dtype=object)
+        motivo.loc[agg["Linhas_Estoque_Validas"].le(0)] = "COLUNA/VALOR DE ESTOQUE AUSENTE"
+        motivo.loc[
+            agg["Linhas_Estoque_Validas"].gt(0)
+            & (estoque_total.isna() | estoque_total.le(0))
+        ] = "ESTOQUE ZERADO OU NEGATIVO"
+        motivo.loc[
+            agg["Linhas_Custo_Validas"].le(0)
+        ] = "CUSTO MÉDIO AUSENTE"
+        motivo.loc[
+            agg["Linhas_Custo_Validas"].gt(0)
+            & (custo_total.isna() | custo_total.le(0))
+        ] = "CUSTO MÉDIO ZERADO OU NEGATIVO"
+        motivo.loc[
+            custo_unit.notna() & custo_unit.gt(0)
+        ] = "CUSTO OFICIAL CALCULADO"
+
+        agg["Motivo_Sem_Custo"] = motivo
+
+        return agg[colunas_saida]
 
     except Exception:
-        return pd.DataFrame(columns=["EAN_JOIN_CUSTO", "Custo_Estoque_Unitario"])
+        return pd.DataFrame(columns=colunas_saida)
 
+
+
+def eirox_v167_mapa_custo_compra(compra_base):
+    """
+    Fallback oficial 2: custo unitário cadastrado em COMPRA_TESTE por EAN.
+    Preserva a regra histórica do projeto: média dos custos válidos por EAN.
+    """
+    try:
+        if not isinstance(compra_base, pd.DataFrame) or compra_base.empty:
+            return pd.DataFrame(columns=["EAN_JOIN_CUSTO","Custo_Compra_Unitario"])
+
+        c = compra_base.copy()
+        ce = eirox_coluna_generica(
+            c, ["EAN","EAN (GTIN)","GTIN","Código de Barras","Codigo de Barras","codigobarras","Barras"]
+        )
+        cc = eirox_coluna_generica(
+            c, ["Custo","Custo Unitário","Custo_Unitario","Custo Unitario","Preço Compra","Preco Compra","Custo Atual"]
+        )
+        if not ce or not cc:
+            return pd.DataFrame(columns=["EAN_JOIN_CUSTO","Custo_Compra_Unitario"])
+
+        c["EAN_JOIN_CUSTO"] = c[ce].apply(
+            lambda x: re.sub(r"\D","",str(x).replace(".0",""))
+        )
+        c["__CUSTO_COMPRA_V167"] = c[cc].apply(eirox_numero_br_para_float)
+        c = c[
+            c["EAN_JOIN_CUSTO"].astype(str).str.len().gt(0)
+            & c["__CUSTO_COMPRA_V167"].notna()
+            & c["__CUSTO_COMPRA_V167"].gt(0)
+        ].copy()
+        if c.empty:
+            return pd.DataFrame(columns=["EAN_JOIN_CUSTO","Custo_Compra_Unitario"])
+
+        out = (
+            c.groupby("EAN_JOIN_CUSTO",as_index=False)["__CUSTO_COMPRA_V167"]
+            .mean()
+            .rename(columns={"__CUSTO_COMPRA_V167":"Custo_Compra_Unitario"})
+        )
+        return out
+    except Exception:
+        return pd.DataFrame(columns=["EAN_JOIN_CUSTO","Custo_Compra_Unitario"])
+
+
+def eirox_v167_mapa_custo_venda_fechada(venda_base):
+    """
+    Fallback oficial 3: custo unitário do último mês fechado com venda por EAN.
+
+    Custo unitário = Custo total / Itens do próprio mês fechado.
+    """
+    try:
+        if not isinstance(venda_base, pd.DataFrame) or venda_base.empty:
+            return pd.DataFrame(columns=["EAN_JOIN_CUSTO","Custo_Venda_Fechada_Unitario","Mes_Custo_Venda"])
+
+        v = venda_base.copy()
+        ce = eirox_coluna_generica(
+            v, ["EAN","EAN (GTIN)","GTIN","Cód. Barras/Etiq.","Cod. Barras/Etiq.","Código de Barras","Codigo de Barras","Barras"]
+        )
+        cq = eirox_coluna_generica(
+            v, ["Itens","Quantidade","Qtd","Qtde","Unidades"]
+        )
+        cc = eirox_coluna_generica(
+            v, ["Custo","Custo Total","CMV","Valor Custo"]
+        )
+        cm = eirox_coluna_generica(
+            v, ["Ano-mês","Ano-mes","Ano mês","Ano mes","Competência","Competencia","Mês","Mes","Data"]
+        )
+        if not ce or not cq or not cc or not cm:
+            return pd.DataFrame(columns=["EAN_JOIN_CUSTO","Custo_Venda_Fechada_Unitario","Mes_Custo_Venda"])
+
+        v["EAN_JOIN_CUSTO"] = v[ce].apply(
+            lambda x: re.sub(r"\D","",str(x).replace(".0",""))
+        )
+        v["__ITENS_V167"] = v[cq].apply(eirox_numero_br_para_float)
+        v["__CUSTO_TOTAL_V167"] = v[cc].apply(eirox_numero_br_para_float)
+
+        def _comp_v167(x):
+            if pd.isna(x):
+                return pd.NaT
+            t = str(x).strip()
+            if re.fullmatch(r"\d{6}", t):
+                try:
+                    return pd.Timestamp(year=int(t[:4]), month=int(t[4:6]), day=1)
+                except Exception:
+                    return pd.NaT
+            d = pd.to_datetime(x, errors="coerce", dayfirst=True)
+            if pd.isna(d):
+                m = re.search(r"(20\d{2})\D?([01]?\d)", t)
+                if m:
+                    try:
+                        return pd.Timestamp(year=int(m.group(1)), month=int(m.group(2)), day=1)
+                    except Exception:
+                        return pd.NaT
+            return pd.Timestamp(year=d.year, month=d.month, day=1) if pd.notna(d) else pd.NaT
+
+        v["__MES_V167"] = v[cm].apply(_comp_v167)
+        atual = pd.Timestamp.now()
+        mes_atual = pd.Timestamp(year=atual.year,month=atual.month,day=1)
+
+        v = v[
+            v["EAN_JOIN_CUSTO"].astype(str).str.len().gt(0)
+            & v["__MES_V167"].notna()
+            & v["__MES_V167"].lt(mes_atual)
+            & v["__ITENS_V167"].fillna(0).gt(0)
+            & v["__CUSTO_TOTAL_V167"].fillna(0).gt(0)
+        ].copy()
+        if v.empty:
+            return pd.DataFrame(columns=["EAN_JOIN_CUSTO","Custo_Venda_Fechada_Unitario","Mes_Custo_Venda"])
+
+        agg = v.groupby(["EAN_JOIN_CUSTO","__MES_V167"],as_index=False).agg(
+            Itens=("__ITENS_V167","sum"),
+            Custo_Total=("__CUSTO_TOTAL_V167","sum"),
+        )
+        agg["Custo_Venda_Fechada_Unitario"] = np.where(
+            agg["Itens"].gt(0),
+            agg["Custo_Total"] / agg["Itens"],
+            np.nan
+        )
+        agg = agg[
+            agg["Custo_Venda_Fechada_Unitario"].notna()
+            & agg["Custo_Venda_Fechada_Unitario"].gt(0)
+        ].copy()
+        if agg.empty:
+            return pd.DataFrame(columns=["EAN_JOIN_CUSTO","Custo_Venda_Fechada_Unitario","Mes_Custo_Venda"])
+
+        agg = agg.sort_values(["EAN_JOIN_CUSTO","__MES_V167"])
+        agg = agg.drop_duplicates("EAN_JOIN_CUSTO",keep="last")
+        agg["Mes_Custo_Venda"] = agg["__MES_V167"].dt.strftime("%Y-%m")
+        return agg[["EAN_JOIN_CUSTO","Custo_Venda_Fechada_Unitario","Mes_Custo_Venda"]]
+    except Exception:
+        return pd.DataFrame(columns=["EAN_JOIN_CUSTO","Custo_Venda_Fechada_Unitario","Mes_Custo_Venda"])
 
 def aplicar_custo_oficial_estoque_teste(df_base, estoque_base=None):
     """
-    Substitui/define Custo pelo custo unitário oficial do ESTOQUE_TESTE:
-    Custo Médio / Estoque.
+    V1.4.68 — hierarquia oficial de custo por EAN, sem COMPRA_TESTE.
+
+    1) ESTOQUE_TESTE: Custo Médio total / Estoque total.
+    2) VENDA_FINAL_TESTE: Custo total / Itens do último mês fechado com venda.
+
+    COMPRA_TESTE não participa mais do custo porque deixou de ser alimentada.
+    Nenhum valor é inventado. A fonte escolhida fica registrada em Fonte_Custo.
     """
     try:
         if not isinstance(df_base, pd.DataFrame) or df_base.empty:
             return df_base
 
         df = df_base.copy()
-        mapa = mapa_custo_unitario_estoque_teste(estoque_base)
 
-        if "Custo" not in df.columns:
+        if "Custo" in df.columns:
+            df["Custo_Anterior_Auditoria"] = pd.to_numeric(df["Custo"], errors="coerce")
+        else:
+            df["Custo_Anterior_Auditoria"] = np.nan
+
+        col_ean = eirox_coluna_generica(
+            df,
+            ["EAN","EAN (GTIN)","GTIN","Código de Barras",
+             "Codigo de Barras","codigobarras"]
+        )
+        if not col_ean:
             df["Custo"] = np.nan
-
-        col_ean = eirox_coluna_generica(df, ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras", "Codigo de Barras", "codigobarras"])
-        if not col_ean or mapa.empty:
+            df["Fonte_Custo"] = ""
+            df["Motivo_Sem_Custo"] = "EAN AUSENTE NA BASE DE PRICING"
             return df
 
-        df["EAN_JOIN_CUSTO"] = df[col_ean].apply(lambda x: re.sub(r"\D", "", str(x).replace(".0", "")))
-        df = df.merge(mapa, on="EAN_JOIN_CUSTO", how="left")
+        df["EAN_JOIN_CUSTO"] = df[col_ean].apply(
+            lambda x: re.sub(r"\D","",str(x).replace(".0",""))
+        )
 
-        custo_estoque = pd.to_numeric(df["Custo_Estoque_Unitario"], errors="coerce")
-        df["Custo"] = custo_estoque.combine_first(pd.to_numeric(df["Custo"], errors="coerce"))
+        # Fonte 1 — estoque atual.
+        mapa_est = mapa_custo_unitario_estoque_teste(estoque_base)
+        if isinstance(mapa_est, pd.DataFrame) and not mapa_est.empty:
+            mapa_est = mapa_est.drop_duplicates("EAN_JOIN_CUSTO", keep="last")
+            df = df.merge(mapa_est, on="EAN_JOIN_CUSTO", how="left")
+        else:
+            df["Custo_Estoque_Unitario"] = np.nan
+            df["Custo_Medio_Total_Base"] = np.nan
+            df["Estoque_Total_Base"] = np.nan
+            df["Motivo_Sem_Custo"] = ""
+            df["Fonte_Custo_Oficial"] = ""
 
-        # Recalcula lucro/margem com custo oficial, quando houver preço atual.
+        # Fonte 2 — último mês fechado da venda.
+        mapa_venda = eirox_v167_mapa_custo_venda_fechada(
+            globals().get("venda_rede", pd.DataFrame())
+        )
+        if isinstance(mapa_venda, pd.DataFrame) and not mapa_venda.empty:
+            df = df.merge(
+                mapa_venda.drop_duplicates("EAN_JOIN_CUSTO", keep="last"),
+                on="EAN_JOIN_CUSTO",
+                how="left"
+            )
+        else:
+            df["Custo_Venda_Fechada_Unitario"] = np.nan
+            df["Mes_Custo_Venda"] = ""
+
+        c_est = pd.to_numeric(
+            df.get("Custo_Estoque_Unitario", np.nan),
+            errors="coerce"
+        )
+        c_vnd = pd.to_numeric(
+            df.get("Custo_Venda_Fechada_Unitario", np.nan),
+            errors="coerce"
+        )
+
+        custo = c_est.where(c_est.gt(0))
+        custo = custo.combine_first(c_vnd.where(c_vnd.gt(0)))
+        df["Custo"] = custo
+
+        fonte = pd.Series("", index=df.index, dtype=object)
+        fonte.loc[c_est.gt(0)] = "ESTOQUE_TESTE — CUSTO MÉDIO / ESTOQUE"
+        fonte.loc[~c_est.gt(0) & c_vnd.gt(0)] = "VENDA_FINAL_TESTE — ÚLTIMO MÊS FECHADO"
+        df["Fonte_Custo"] = fonte
+
+        # Diagnóstico final: só é SEM CUSTO se as duas fontes falharem.
+        motivo_est = df.get(
+            "Motivo_Sem_Custo",
+            pd.Series("", index=df.index)
+        ).fillna("").astype(str)
+
+        motivo = pd.Series("", index=df.index, dtype=object)
+        ok = custo.notna() & custo.gt(0)
+        motivo.loc[ok] = "CUSTO LOCALIZADO"
+
+        sem = ~ok
+        ean_vazio = df["EAN_JOIN_CUSTO"].astype(str).str.len().eq(0)
+        motivo.loc[sem & ean_vazio] = "EAN INVÁLIDO"
+
+        motivo.loc[
+            sem & ~ean_vazio
+            & c_est.isna()
+            & c_vnd.isna()
+        ] = "EAN SEM CUSTO NAS 2 FONTES"
+
+        # Preserva razão técnica do estoque quando ela é mais específica.
+        espec = sem & motivo_est.ne("") & ~motivo_est.eq("CUSTO OFICIAL CALCULADO")
+        motivo.loc[espec & motivo.eq("")] = motivo_est.loc[espec]
+
+        motivo.loc[sem & motivo.eq("")] = "CUSTO NÃO LOCALIZADO"
+        df["Motivo_Sem_Custo"] = motivo
+
+        df["Estoque_Base_Custo"] = pd.to_numeric(
+            df.get("Estoque_Total_Base", np.nan),
+            errors="coerce"
+        )
+
+        # Recalcula lucro e margem usando apenas as duas fontes oficiais.
         preco = None
-        for c in ["Preco_Atual", "Preço Atual", "Preco Atual", "Preço_Atual"]:
+        for c in [
+            "Preco_Atual","Preço Atual","Preco Atual","Preço_Atual",
+            "Preco_Ultima_Venda","Preço Última Venda"
+        ]:
             if c in df.columns:
-                preco = pd.to_numeric(df[c], errors="coerce")
-                break
+                s = pd.to_numeric(df[c], errors="coerce")
+                if s.notna().any():
+                    preco = s
+                    break
 
         if preco is not None:
-            df["Lucro_Unitario"] = preco.fillna(0) - pd.to_numeric(df["Custo"], errors="coerce").fillna(0)
+            df["Lucro_Unitario"] = np.where(
+                preco.gt(0) & custo.gt(0),
+                preco - custo,
+                np.nan
+            )
             df["Lucro Unitário"] = df["Lucro_Unitario"]
-            df["Margem_%"] = np.where(preco.fillna(0) > 0, df["Lucro_Unitario"] / preco, 0)
+            df["Margem_%"] = np.where(
+                preco.gt(0) & custo.gt(0),
+                df["Lucro_Unitario"] / preco,
+                np.nan
+            )
 
-        df.drop(columns=["EAN_JOIN_CUSTO", "Custo_Estoque_Unitario"], inplace=True, errors="ignore")
+        df.drop(
+            columns=[
+                "EAN_JOIN_CUSTO",
+                "Custo_Estoque_Unitario",
+                "Fonte_Custo_Oficial",
+                "Estoque_Total_Base",
+                "Custo_Compra_Unitario",
+            ],
+            inplace=True,
+            errors="ignore"
+        )
         return df
 
     except Exception:
         return df_base
+
+
+
 
 
 def aplicar_regras_cliente_e_custo_oficiais(df_base, estoque_base=None):
@@ -4107,11 +5035,22 @@ def eirox_montar_cliente_x_concorrente(base_preparada, rede_concorrente):
         if principal.empty or concorr.empty:
             return pd.DataFrame()
 
-        # Menor preço válido de cada rede, considerando somente o preço
-        # mais recente de cada farmácia (já tratado no preparo).
-        idx_cli = principal.groupby("EAN_CMP")["PRECO_CMP"].idxmin()
-        cli = principal.loc[idx_cli].copy()
+        # REGRA GLOBAL V1.4.37: para o Principal, usa a última venda/pesquisa
+        # por EAN conforme a Data da Pesquisa. Não usa menor preço nem média.
+        principal["_ORDEM_PRINC_CMP"] = range(len(principal))
+        principal["_DATA_PRINC_CMP"] = pd.to_datetime(principal["DATA_CMP"], errors="coerce")
+        principal["_DATA_ORD_PRINC_CMP"] = principal["_DATA_PRINC_CMP"].fillna(pd.Timestamp.min)
+        cli = (
+            principal.sort_values(
+                ["EAN_CMP", "_DATA_ORD_PRINC_CMP", "_ORDEM_PRINC_CMP"],
+                ascending=[True, True, True]
+            )
+            .groupby("EAN_CMP", as_index=False, dropna=False)
+            .tail(1)
+            .copy()
+        )
 
+        # Concorrente mantém a regra de menor preço válido.
         idx_con = concorr.groupby("EAN_CMP")["PRECO_CMP"].idxmin()
         con = concorr.loc[idx_con].copy()
 
@@ -4190,16 +5129,27 @@ def eirox_montar_cliente_x_concorrente(base_preparada, rede_concorrente):
 
 
 def eirox_brl(valor, vazio="—"):
-    """Formata valor monetário no padrão brasileiro: R$ 1.234,56."""
+    """Moeda pt-BR; nunca converte ausência em zero."""
     try:
-        if valor is None or (isinstance(valor, float) and np.isnan(valor)):
+        if valor is None or pd.isna(valor):
             return vazio
+        if isinstance(valor, str):
+            s = valor.strip().replace("R$", "").replace("\\u00a0", "").replace(" ", "")
+            if not s or s.lower() in {"none", "nan", "nat", "null"}:
+                return vazio
+            if "," in s and "." in s:
+                s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
+            elif "," in s:
+                s = s.replace(",", ".")
+            valor = s
         n = float(valor)
-        s = f"{n:,.2f}"
-        s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+        if not np.isfinite(n):
+            return vazio
+        s = f"{n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         return f"R$ {s}"
-    except Exception:
+    except (ValueError, TypeError, OverflowError):
         return vazio
+
 
 
 def eirox_percentual_br(valor, casas=2, vazio="—"):
@@ -4700,7 +5650,7 @@ def eirox_excel_padrao_bytes(df, titulo="Exportação Eirox", nome_aba="Dados"):
         # título
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
         c = ws.cell(1, 1)
-        c.value = f"INSIGHTFARMA PRICING ENTERPRISE | {titulo}"
+        c.value = f"{EIROX_CLIENT_PROFILE['excel_brand']} | {titulo}"
         c.font = Font(color=white, bold=True, size=16)
         c.fill = PatternFill("solid", fgColor=bg_title)
         c.alignment = Alignment(horizontal="left", vertical="center")
@@ -5116,6 +6066,70 @@ def eirox_forcar_nome_cliente_em_rede_principal(base):
         return base
 
 
+
+def eirox_ultimo_preco_principal_por_ean(base, preco_col="Preço (R$)"):
+    """
+    Regra global V1.4.37:
+    para o Principal, o preço de referência por EAN é SEMPRE o preço da
+    ocorrência mais recente conforme a Data da Pesquisa. Não usa média nem
+    menor preço histórico do Principal.
+
+    Em empate de data, preserva a última ocorrência física da base.
+    Se não houver coluna/data válida, usa a última ocorrência física por EAN.
+    """
+    try:
+        if not isinstance(base, pd.DataFrame) or base.empty:
+            return pd.DataFrame()
+
+        b = base.copy()
+        if "EAN" not in b.columns and "EAN (GTIN)" in b.columns:
+            b["EAN"] = b["EAN (GTIN)"]
+        if "EAN" not in b.columns or preco_col not in b.columns:
+            return pd.DataFrame()
+
+        b["EAN"] = (
+            b["EAN"].astype(str)
+            .str.replace(".0", "", regex=False)
+            .str.replace(r"\D", "", regex=True)
+            .str.strip()
+        )
+        b[preco_col] = pd.to_numeric(b[preco_col], errors="coerce")
+        b = b[b["EAN"].ne("") & b[preco_col].notna() & b[preco_col].gt(0)].copy()
+        if b.empty:
+            return b
+
+        data_col = None
+        for c in [
+            "Data Emissão", "Data Emissao", "Data da Pesquisa", "Data Pesquisa",
+            "Data_Pesquisa", "Dt Pesquisa", "Data", "Data_Hora", "Data Hora"
+        ]:
+            if c in b.columns:
+                data_col = c
+                break
+
+        b["_ORDEM_PRINCIPAL"] = range(len(b))
+        if data_col:
+            b["_DATA_PRINCIPAL"] = pd.to_datetime(
+                b[data_col], errors="coerce", dayfirst=True
+            )
+        else:
+            b["_DATA_PRINCIPAL"] = pd.NaT
+
+        # Data mais recente vence. Quando ausente/empatada, vence a última linha.
+        b["_DATA_ORD_PRINCIPAL"] = b["_DATA_PRINCIPAL"].fillna(pd.Timestamp.min)
+        b = (
+            b.sort_values(
+                ["EAN", "_DATA_ORD_PRINCIPAL", "_ORDEM_PRINCIPAL"],
+                ascending=[True, True, True]
+            )
+            .groupby("EAN", as_index=False, dropna=False)
+            .tail(1)
+            .copy()
+        )
+        return b
+    except Exception:
+        return pd.DataFrame()
+
 def eirox_base_principal_concorrente_global(df_base):
     """
     Retorna base total, base principal e base concorrente usando sempre o cliente em contexto.
@@ -5251,10 +6265,21 @@ def eirox_preferir_base_cliente_se_tiver_mais_produtos(preco_selecionado_atual, 
 
         nova_qtd = int(base_cliente["EAN"].nunique()) if "EAN" in base_cliente.columns else len(base_cliente)
 
-        if nova_qtd > atual_qtd:
+        # A base interna é somente fallback para EAN sem pesquisa do Principal.
+        # Nunca substitui o preço pesquisado mais recente de um EAN já encontrado.
+        if not isinstance(preco_selecionado_atual, pd.DataFrame) or preco_selecionado_atual.empty:
             return base_cliente
+        if not isinstance(base_cliente, pd.DataFrame) or base_cliente.empty:
+            return preco_selecionado_atual
 
-        return preco_selecionado_atual
+        atual = preco_selecionado_atual.copy()
+        interno = base_cliente.copy()
+        eans_atual = set(atual["EAN"].astype(str)) if "EAN" in atual.columns else set()
+        if "EAN" in interno.columns:
+            interno = interno[~interno["EAN"].astype(str).isin(eans_atual)].copy()
+        if interno.empty:
+            return atual
+        return pd.concat([atual, interno], ignore_index=True, sort=False)
 
     except Exception:
         return preco_selecionado_atual
@@ -5470,18 +6495,16 @@ def eirox_numero_engine_rec(df, opcoes, default=0):
 
 def aplicar_engine_recomendacoes_restaurada(df_base):
     """
-    Recalcula SEMPRE a recomendação, sem reaproveitar a coluna simplificada atual.
+    V1.4.54 — recomendações do Painel Geral calculadas sobre a mesma fonte
+    financeira do motor central.
 
-    Categorias oficiais do projeto antigo:
+    Categorias preservadas:
     - SUBIR PREÇO URGENTE
     - SUBIR PREÇO
     - MANTER
     - COMPETITIVO
     - ANALISAR REDUÇÃO
     - SEM CUSTO
-
-    A distribuição volta a depender da regra de negócio, e não apenas da coluna
-    simplificada que estava chegando com 2 ou 3 categorias.
     """
     try:
         if not isinstance(df_base, pd.DataFrame) or df_base.empty:
@@ -5489,181 +6512,125 @@ def aplicar_engine_recomendacoes_restaurada(df_base):
 
         df = df_base.copy()
 
-        custo = eirox_numero_engine_rec(
-            df,
-            [
-                "Custo",
-                "Custo Unitário",
-                "Custo_Unitario",
-                "Custo_Estoque_Unitario",
-                "Custo Médio Unitário",
-                "Custo Medio Unitario"
-            ],
-            0
+        # Fonte financeira única: aplica Preço Atual oficial, mercado e custo
+        # exatamente como nas telas de ação.
+        motor = eirox_motor_oportunidades(df)
+        if not isinstance(motor, pd.DataFrame) or motor.empty:
+            return df
+
+        motor = motor.reindex(df.index)
+
+        custo = pd.to_numeric(
+            motor.get("Custo_Unitario_Eirox", pd.Series(np.nan,index=df.index)),
+            errors="coerce"
         )
-
-        preco_atual = eirox_numero_engine_rec(
-            df,
-            [
-                "Preco_Atual",
-                "Preço Atual",
-                "Preco Atual",
-                "Preço_Atual",
-                "Preco_Selecionado",
-                "Preço Principal",
-                "Preco_Principal",
-                "Preco_Medio",
-                "Preço Médio"
-            ],
-            0
+        preco_atual = pd.to_numeric(
+            motor.get("Preço_Atual_Eirox", pd.Series(np.nan,index=df.index)),
+            errors="coerce"
         )
-
-        preco_sugerido = eirox_numero_engine_rec(
-            df,
-            [
-                "Preco_Sugerido_Mercado",
-                "Preço Sugerido Mercado",
-                "Preco_Recomendado",
-                "Preço Recomendado",
-                "Preço Máximo Competitivo",
-                "Preco_Maximo_Competitivo",
-                "Preco_Maximo_Competitivo_Final",
-                "Preço_Sugerido_Cluster_2KM",
-                "Preço_Sugerido_Regra_Custo_2KM"
-            ],
-            0
+        referencia = pd.to_numeric(
+            motor.get("Preço_Mercado_Eirox", pd.Series(np.nan,index=df.index)),
+            errors="coerce"
         )
+        ganho_potencial = pd.to_numeric(
+            motor.get("Ganho_Lucro_Potencial_Eirox", pd.Series(0,index=df.index)),
+            errors="coerce"
+        ).fillna(0)
+        qtd_vendida = pd.to_numeric(
+            motor.get("Qtd_Vendida_Eirox", pd.Series(0,index=df.index)),
+            errors="coerce"
+        ).fillna(0)
 
-        menor_concorrente = eirox_numero_engine_rec(
-            df,
-            [
-                "Menor_Preco_Concorrente",
-                "Menor Preço Concorrente",
-                "Menor_Preco",
-                "Menor Preço",
-                "Menor_Preço",
-                "Menor_Preço_Concorrente_2KM"
-            ],
-            0
-        )
-
-        preco_medio = eirox_numero_engine_rec(
-            df,
-            [
-                "Preco_Medio",
-                "Preço Médio",
-                "Preço_Médio_Concorrente_2KM",
-                "Preco_Medio_Concorrente"
-            ],
-            0
-        )
-
-        ganho_potencial = eirox_numero_engine_rec(
-            df,
-            [
-                "Ganho_Potencial_Simulador",
-                "Ganho_Potencial",
-                "Ganho Potencial",
-                "Ganho Produto",
-                "Ganho_Produto",
-                "Ganho_Potencial_Final",
-                "Ganho_Potencial_Atualizado"
-            ],
-            0
-        )
-
-        qtd_vendida = eirox_numero_engine_rec(
-            df,
-            [
-                "Qtd Vendida Mês Anterior",
-                "Qtd_Vendida_Mes_Anterior",
-                "Quantidade",
-                "Qtd",
-                "Qtd_Pesquisas_Selecionado"
-            ],
-            0
-        )
-
-        # Referência de mercado prioritária.
-        referencia = preco_sugerido.copy()
-        referencia = referencia.where(referencia > 0, menor_concorrente)
-        referencia = referencia.where(referencia > 0, preco_medio)
-        referencia = referencia.where(referencia > 0, preco_atual)
-
-        # Diferença positiva indica que pode subir preço.
+        # Só há recomendação de preço quando existe preço atual válido.
         dif_referencia_rs = referencia - preco_atual
+        dif_referencia_pct = pd.Series(np.nan,index=df.index,dtype="float64")
+        mask_preco = preco_atual.gt(0) & referencia.gt(0)
+        dif_referencia_pct.loc[mask_preco] = (
+            dif_referencia_rs.loc[mask_preco] /
+            preco_atual.loc[mask_preco]
+        )
 
-        dif_referencia_pct = pd.Series(0.0, index=df.index)
-        mask_preco = preco_atual > 0
-        dif_referencia_pct.loc[mask_preco] = dif_referencia_rs.loc[mask_preco] / preco_atual.loc[mask_preco]
+        margem_atual = pd.Series(np.nan,index=df.index,dtype="float64")
+        mask_margem = preco_atual.gt(0) & custo.notna() & custo.ge(0)
+        margem_atual.loc[mask_margem] = (
+            (preco_atual.loc[mask_margem] - custo.loc[mask_margem]) /
+            preco_atual.loc[mask_margem]
+        )
 
-        margem_atual = pd.Series(0.0, index=df.index)
-        margem_atual.loc[mask_preco] = (preco_atual.loc[mask_preco] - custo.loc[mask_preco]) / preco_atual.loc[mask_preco]
+        margem_ref = pd.Series(np.nan,index=df.index,dtype="float64")
+        mask_ref = referencia.gt(0) & custo.notna() & custo.ge(0)
+        margem_ref.loc[mask_ref] = (
+            (referencia.loc[mask_ref] - custo.loc[mask_ref]) /
+            referencia.loc[mask_ref]
+        )
 
-        margem_ref = pd.Series(0.0, index=df.index)
-        mask_ref = referencia > 0
-        margem_ref.loc[mask_ref] = (referencia.loc[mask_ref] - custo.loc[mask_ref]) / referencia.loc[mask_ref]
-
-        rec = pd.Series("MANTER", index=df.index, dtype=object)
+        rec = pd.Series("MANTER",index=df.index,dtype=object)
 
         # 1) Sem custo prevalece.
-        rec.loc[custo <= 0] = "SEM CUSTO"
+        sem_custo = custo.isna() | custo.le(0)
+        rec.loc[sem_custo] = "SEM CUSTO"
 
-        # 2) Analisar redução: preço atual acima do mercado/referência.
+        # 2) Acima do mercado em 5% ou mais.
         rec.loc[
-            (custo > 0)
-            & (preco_atual > 0)
-            & (referencia > 0)
-            & (dif_referencia_pct <= -0.05)
+            ~sem_custo
+            & preco_atual.gt(0)
+            & referencia.gt(0)
+            & dif_referencia_pct.le(-0.05)
         ] = "ANALISAR REDUÇÃO"
 
-        # 3) Competitivo: preço atual muito próximo/abaixo do mercado, mas com margem.
+        # 3) Faixa competitiva: próximo da referência, com margem positiva.
         rec.loc[
-            (custo > 0)
-            & (preco_atual > 0)
-            & (margem_atual > 0)
-            & (dif_referencia_pct > -0.05)
-            & (dif_referencia_pct <= 0.025)
+            ~sem_custo
+            & preco_atual.gt(0)
+            & referencia.gt(0)
+            & margem_atual.gt(0)
+            & dif_referencia_pct.gt(-0.05)
+            & dif_referencia_pct.le(0.025)
         ] = "COMPETITIVO"
 
-        # 4) Subir preço: existe espaço para ganho.
+        # 4) Há espaço relevante para subir.
         rec.loc[
-            (custo > 0)
-            & (preco_atual > 0)
-            & (referencia > 0)
-            & (dif_referencia_pct > 0.025)
+            ~sem_custo
+            & preco_atual.gt(0)
+            & referencia.gt(0)
+            & dif_referencia_pct.gt(0.025)
         ] = "SUBIR PREÇO"
 
-        # 5) Subir urgente: alto gap, alto potencial ou alto volume.
+        # 5) Prioridade urgente: gap, ganho ou volume relevantes.
         rec.loc[
-            (custo > 0)
-            & (preco_atual > 0)
-            & (referencia > 0)
+            ~sem_custo
+            & preco_atual.gt(0)
+            & referencia.gt(0)
             & (
-                (dif_referencia_pct >= 0.10)
-                | ((dif_referencia_pct >= 0.06) & (ganho_potencial >= 1000))
-                | ((dif_referencia_pct >= 0.05) & (qtd_vendida >= 100))
-                | (ganho_potencial >= 3000)
+                dif_referencia_pct.ge(0.10)
+                | (dif_referencia_pct.ge(0.06) & ganho_potencial.ge(1000))
+                | (dif_referencia_pct.ge(0.05) & qtd_vendida.ge(100))
+                | ganho_potencial.ge(3000)
             )
         ] = "SUBIR PREÇO URGENTE"
 
-        # 6) Manter: alinhado, sem pressão e com margem positiva.
+        # 6) Alinhado e saudável: manter. Isso é mais restrito que COMPETITIVO.
         rec.loc[
-            (custo > 0)
-            & (preco_atual > 0)
-            & (referencia > 0)
-            & (dif_referencia_pct.abs() <= 0.025)
-            & (margem_atual >= 0.10)
+            ~sem_custo
+            & preco_atual.gt(0)
+            & referencia.gt(0)
+            & dif_referencia_pct.abs().le(0.01)
+            & margem_atual.ge(0.10)
         ] = "MANTER"
 
-        # 7) Se não tem referência real, mas tem custo/preço, manter.
+        # Sem referência de mercado, mas com preço e custo válidos: manter.
         rec.loc[
-            (custo > 0)
-            & (preco_atual > 0)
-            & (referencia <= 0)
+            ~sem_custo
+            & preco_atual.gt(0)
+            & (~referencia.gt(0))
         ] = "MANTER"
 
-        # Sanitiza categorias oficiais.
+        # Sem preço atual não deve virar artificialmente uma ação de preço.
+        rec.loc[
+            ~sem_custo
+            & (~preco_atual.gt(0))
+        ] = "MANTER"
+
         categorias = [
             "SUBIR PREÇO URGENTE",
             "SUBIR PREÇO",
@@ -5672,25 +6639,29 @@ def aplicar_engine_recomendacoes_restaurada(df_base):
             "ANALISAR REDUÇÃO",
             "SEM CUSTO"
         ]
-
         rec = rec.fillna("MANTER").astype(str).str.upper().str.strip()
-        rec = rec.where(rec.isin(categorias), "MANTER")
+        rec = rec.where(rec.isin(categorias),"MANTER")
 
         df["Recomendacao"] = rec
         df["Recomendação"] = rec
         df["Recomendacao_Oficial"] = rec
         df["Recomendação Oficial"] = rec
 
-        # Colunas auxiliares para auditoria da recomendação.
+        # Auditoria das regras.
+        df["Preco_Atual_Recomendacao"] = preco_atual
         df["Referencia_Mercado_Recomendacao"] = referencia
+        df["Custo_Recomendacao"] = custo
         df["Dif_Referencia_%"] = dif_referencia_pct
         df["Margem_Atual_Recomendacao"] = margem_atual
         df["Margem_Referencia_Recomendacao"] = margem_ref
+        df["Ganho_Potencial_Recomendacao"] = ganho_potencial
+        df["Qtd_Vendida_Recomendacao"] = qtd_vendida
 
         return df
 
     except Exception:
         return df_base
+
 
 
 def eirox_acoes_recomendadas_pricing_antigo():
@@ -7056,61 +8027,36 @@ def eirox_enriquecer_pipeline_municipio(df_pesquisa, compra_base, estoque_base, 
         except Exception:
             pass
 
+        # V1.4.66 — barreira final: nenhum enriquecimento posterior pode
+        # substituir a fonte oficial do custo.
+        try:
+            dfp = aplicar_custo_oficial_estoque_teste(dfp, estoque_base)
+            dfp = aplicar_engine_recomendacoes_restaurada(dfp)
+        except Exception:
+            pass
+
         return dfp
 
     except Exception:
         return df_pesquisa
 
 
-VERSAO_APP = "Enterprise v1.4.47"
+# EIROX PRICING 2.0 — FASE 7: NAVEGAÇÃO, FILTROS E EXPORTAÇÃO GLOBAL.
+VERSAO_APP = "Enterprise 2.0 — Fase 8.19 — Unidade Numeral Forçada"
 
 # --------------------------------------------------
 # FORMATACAO BRASIL
 # --------------------------------------------------
 
 def moeda_br(valor):
+    return eirox_brl(valor, vazio="")
 
-    try:
-
-        if pd.isna(valor):
-            return ""
-
-        return (
-            f"{eirox_brl(float(valor))}"
-            .replace(",", "X")
-            .replace(".", ",")
-            .replace("X", ".")
-        )
-
-    except Exception:
-        return ""
 
 
 def moeda_br_kpi(valor):
+    """Mostra o valor completo, sem abreviação MM ou perda de centavos."""
+    return eirox_brl(valor, vazio="—")
 
-    """
-    Formata moeda para KPI sem cortar o valor no card.
-    Mantém o padrão brasileiro e usa MM quando o valor passa de 1 milhão.
-    """
-
-    try:
-        if pd.isna(valor):
-            return ""
-
-        valor = float(valor)
-
-        if abs(valor) >= 1_000_000:
-            return (
-                f"{eirox_brl(valor / 1_000_000)} MM"
-                .replace(",", "X")
-                .replace(".", ",")
-                .replace("X", ".")
-            )
-
-        return moeda_br(valor)
-
-    except Exception:
-        return moeda_br(valor)
 
 
 def numero_br(valor):
@@ -7207,18 +8153,22 @@ def _eirox_tipo_coluna_br(nome_coluna):
     ]):
         return "percentual"
 
+    # V8.18 — colunas explicitamente de unidades/quantidade têm prioridade
+    # sobre palavras financeiras como "venda". Ex.: "Média Venda/Mês (Unid.)"
+    # deve ser exibida como número inteiro, nunca como R$.
+    if any(t in nome for t in [
+        "qtd", "qtde", "quantidade", "unidade", "unidades", "unid", "(unid.)",
+        "estoque", "itens", "produtos", "skus", "ranking", "posição", "posicao",
+        "arquivos", "registros"
+    ]):
+        return "inteiro"
+
     if any(t in nome for t in [
         "preço", "preco", "custo", "valor", "faturamento", "venda",
         "receita", "lucro", "ganho", "potencial", "captura", "ticket",
         "despesa", "saldo", "total r$", "r$", "recomendado", "sugerido"
     ]):
         return "moeda"
-
-    if any(t in nome for t in [
-        "qtd", "qtde", "quantidade", "unidades", "estoque", "itens",
-        "produtos", "skus", "ranking", "posição", "posicao", "arquivos", "registros"
-    ]):
-        return "inteiro"
 
     if "score" in nome or "índice" in nome or "indice" in nome:
         return "numero"
@@ -7607,7 +8557,7 @@ def mostrar_explicacao_visao_eirox(nome_visao):
                     "Produtos = quantidade total de EANs/produtos analisados.",
                     "Margem Média = média da margem atual dos produtos.",
                     "Lucro Médio = média do lucro unitário calculado.",
-                    "Potencial de Captura = soma do ganho potencial identificado na base.",
+                    "Potencial de Captura = soma das oportunidades válidas de subida, sem misturar redução de custo ou impacto de baixa.",
                     "Preço Médio = média dos preços atuais ou pesquisados.",
                     "Laboratórios = quantidade de laboratórios distintos na base."
                 ]
@@ -7818,8 +8768,7 @@ def propagar_ganho_potencial(base):
 
 def preparar_ganho_oficial_dashboard(base):
     """
-    Usa exclusivamente o Ganho_Potencial da Analise_Pricing.xlsx.
-    Não usa simulacao_global, histórico ou fallback.
+    Mantém somente ganhos não negativos já reconciliados pelo motor atual.
     """
 
     base = base.copy()
@@ -7845,13 +8794,8 @@ def preparar_ganho_oficial_dashboard(base):
                 .eq("TOTAL GERAL")
             ].copy()
 
-    # Remove ganhos absurdos provocados por leitura/fallback indevido
-    base = base[
-        base["Ganho_Potencial"].between(
-            0,
-            10_000_000
-        )
-    ].copy()
+    # V1.4.55 — sem teto arbitrário: valores são validados pela origem financeira.
+    base = base[base["Ganho_Potencial"].ge(0)].copy()
 
     return base
 
@@ -8373,7 +9317,7 @@ def preco_referencia_seguro(valores):
     return float(s.quantile(0.75))
 
 
-def recalcular_ganho_inteligente(df_base, venda_rede_base, historico_base):
+def _v143_original_recalcular_ganho_inteligente(df_base, venda_rede_base, historico_base):
 
     if (
         not isinstance(df_base, pd.DataFrame)
@@ -8499,10 +9443,8 @@ def recalcular_ganho_inteligente(df_base, venda_rede_base, historico_base):
         ["data", "dt"]
     )
 
-    # Em bases tipo VENDA_FINAL_TESTE, a coluna "Venda" é total e "Itens" é quantidade.
-    # Quando existir Venda + Itens, usar essa combinação para preço atual.
-    if col_valor_total and col_qtd:
-        col_preco_venda = None
+    # REGRA V1.4.39: Venda + Itens são totais agregados e NÃO formam Preço Atual.
+    # Só uma coluna unitária explícita, acompanhada de data/hora, pode alimentar o Principal.
 
     if (
         not col_ean_venda
@@ -8523,40 +9465,54 @@ def recalcular_ganho_inteligente(df_base, venda_rede_base, historico_base):
 
     hist = hist[(hist[col_preco_hist] > 0) & (hist[col_preco_hist] <= 5000)].copy()
 
-    if col_preco_venda:
+    # V1.4.38 — REGRA GLOBAL DO PRINCIPAL:
+    # volume é somado, porém Preço Atual é SEMPRE a última venda pela data/hora.
+    venda[col_qtd] = converter_numero_brasil(venda[col_qtd])
+    vendas = (
+        venda.dropna(subset=["EAN", col_qtd])
+        .groupby("EAN", as_index=False)
+        .agg(Qtd_Vendida_Mes_Anterior=(col_qtd, "sum"))
+    )
 
+    if col_valor_total:
+        venda[col_valor_total] = converter_numero_brasil(venda[col_valor_total])
+        _tot = (
+            venda.dropna(subset=["EAN", col_valor_total])
+            .groupby("EAN", as_index=False)
+            .agg(Venda_Preco_Antigo=(col_valor_total, "sum"))
+        )
+        vendas = vendas.merge(_tot, on="EAN", how="left")
+
+    if col_preco_venda:
         venda[col_preco_venda] = converter_numero_brasil(venda[col_preco_venda])
 
-        vendas = (
-            venda
-            .dropna(subset=["EAN", col_qtd, col_preco_venda])
-            .groupby("EAN")
-            .agg(
-                Qtd_Vendida_Mes_Anterior=(col_qtd, "sum"),
-                Preco_Atual=(col_preco_venda, "mean")
-            )
-            .reset_index()
-        )
-
+    _ult_venda = eirox_ultima_venda_por_ean(
+        venda, col_ean_venda, qtd_col=col_qtd, preco_col=col_preco_venda,
+        valor_total_col=col_valor_total
+    )
+    vendas = vendas.merge(_ult_venda, on="EAN", how="left")
+    vendas = vendas.rename(columns={"Preco_Ultima_Venda": "Preco_Atual"})
+    if "Venda_Preco_Antigo" in vendas.columns:
+        _q_ref = pd.to_numeric(vendas["Qtd_Vendida_Mes_Anterior"], errors="coerce").replace(0, np.nan)
+        _v_ref = pd.to_numeric(vendas["Venda_Preco_Antigo"], errors="coerce")
+        vendas["Preco_Referencia_Calculo"] = (_v_ref / _q_ref).where((_v_ref > 0) & (_q_ref > 0))
+    else:
+        vendas["Preco_Referencia_Calculo"] = np.nan
+    vendas = vendas[vendas["Qtd_Vendida_Mes_Anterior"] > 0].copy()
+    if "Venda_Preco_Antigo" not in vendas.columns:
         vendas["Venda_Preco_Antigo"] = vendas["Qtd_Vendida_Mes_Anterior"] * vendas["Preco_Atual"]
 
+    # V1.4.42: devolve ao dataframe mestre a referência mensal separada.
+    # Isso preserva as sugestões quando VENDA_FINAL_TESTE é agregada por mês,
+    # sem preencher ou falsificar Preco_Atual.
+    _ref_cols = vendas[["EAN", "Preco_Referencia_Calculo"]].drop_duplicates("EAN")
+    if "Preco_Referencia_Calculo" in df_calc.columns:
+        _ref_map = _ref_cols.set_index("EAN")["Preco_Referencia_Calculo"]
+        _ref_atual = pd.to_numeric(df_calc["Preco_Referencia_Calculo"], errors="coerce")
+        _ref_nova = df_calc["EAN"].map(_ref_map)
+        df_calc["Preco_Referencia_Calculo"] = _ref_atual.where(_ref_atual.notna() & (_ref_atual > 0), _ref_nova)
     else:
-
-        venda[col_valor_total] = converter_numero_brasil(venda[col_valor_total])
-
-        vendas = (
-            venda
-            .dropna(subset=["EAN", col_qtd, col_valor_total])
-            .groupby("EAN")
-            .agg(
-                Qtd_Vendida_Mes_Anterior=(col_qtd, "sum"),
-                Venda_Preco_Antigo=(col_valor_total, "sum")
-            )
-            .reset_index()
-        )
-
-        vendas = vendas[vendas["Qtd_Vendida_Mes_Anterior"] > 0].copy()
-        vendas["Preco_Atual"] = vendas["Venda_Preco_Antigo"] / vendas["Qtd_Vendida_Mes_Anterior"]
+        df_calc = df_calc.merge(_ref_cols, on="EAN", how="left")
 
     mercado = (
         hist
@@ -8610,18 +9566,23 @@ def recalcular_ganho_inteligente(df_base, venda_rede_base, historico_base):
     simulacao = vendas.merge(mercado, on="EAN", how="inner")
 
     simulacao["Preco_Atual"] = pd.to_numeric(simulacao["Preco_Atual"], errors="coerce")
+    simulacao["Preco_Referencia_Calculo"] = pd.to_numeric(simulacao["Preco_Referencia_Calculo"], errors="coerce")
+    simulacao["Preco_Base_Calculo"] = simulacao["Preco_Atual"].where(
+        simulacao["Preco_Atual"].notna() & (simulacao["Preco_Atual"] > 0),
+        simulacao["Preco_Referencia_Calculo"]
+    )
     simulacao["Preco_Sugerido_Mercado"] = pd.to_numeric(simulacao["Preco_Sugerido_Mercado"], errors="coerce")
 
     simulacao = simulacao[
         (simulacao["Qtd_Vendida_Mes_Anterior"] > 0)
-        & (simulacao["Preco_Atual"] > 0)
+        & (simulacao["Preco_Base_Calculo"] > 0)
         & (simulacao["Preco_Sugerido_Mercado"] > 0)
-        & (simulacao["Preco_Sugerido_Mercado"] <= simulacao["Preco_Atual"] * 3)
-        & (simulacao["Preco_Sugerido_Mercado"] >= simulacao["Preco_Atual"] * 0.5)
+        & (simulacao["Preco_Sugerido_Mercado"] <= simulacao["Preco_Base_Calculo"] * 3)
+        & (simulacao["Preco_Sugerido_Mercado"] >= simulacao["Preco_Base_Calculo"] * 0.5)
     ].copy()
 
     simulacao["Venda_Projetada_Preco_Sugerido"] = simulacao["Qtd_Vendida_Mes_Anterior"] * simulacao["Preco_Sugerido_Mercado"]
-    simulacao["Ganho_Unitario"] = simulacao["Preco_Sugerido_Mercado"] - simulacao["Preco_Atual"]
+    simulacao["Ganho_Unitario"] = simulacao["Preco_Sugerido_Mercado"] - simulacao["Preco_Base_Calculo"]
     simulacao["Ganho_Potencial_Simulador"] = simulacao["Venda_Projetada_Preco_Sugerido"] - simulacao["Venda_Preco_Antigo"]
 
     simulacao = simulacao[simulacao["Ganho_Potencial_Simulador"] > 0].copy()
@@ -8640,6 +9601,8 @@ def recalcular_ganho_inteligente(df_base, venda_rede_base, historico_base):
 
     for c in [
         "Preco_Atual",
+        "Preco_Referencia_Calculo",
+        "Preco_Base_Calculo",
         "Preco_Sugerido_Mercado",
         "Menor_Preco",
         "Ganho_Unitario",
@@ -8677,6 +9640,298 @@ def recalcular_ganho_inteligente(df_base, venda_rede_base, historico_base):
     ].max(axis=1)
 
     return df_calc, simulacao, "venda_rede_historico_inteligente"
+
+
+
+def eirox_v158_ultimo_mes_fechado_memoria(venda_base):
+    """Último mês fechado com venda por EAN usando apenas funções já disponíveis."""
+    vazio = pd.DataFrame(columns=[
+        "EAN","Venda_Mes_Fechado","Itens_Mes_Fechado",
+        "Mes_Fechado_Referencia","Preco_Fallback_Mes_Fechado"
+    ])
+    if not isinstance(venda_base,pd.DataFrame) or venda_base.empty:
+        return vazio
+
+    b=venda_base.copy()
+    b.columns=b.columns.astype(str).str.strip()
+
+    def _local_col(df, candidatos):
+        norm={re.sub(r"[^a-z0-9]","",str(c).lower()):c for c in df.columns}
+        for cand in candidatos:
+            k=re.sub(r"[^a-z0-9]","",str(cand).lower())
+            if k in norm:
+                return norm[k]
+        return None
+
+    ce=_local_col(b,[
+        "EAN","EAN (GTIN)","GTIN","Cód. Barras/Etiq.","Cod. Barras/Etiq.",
+        "Código de Barras","Codigo de Barras"
+    ])
+    cv=_local_col(b,[
+        "Venda","Valor Venda","Faturamento","Valor Líquido","Valor Liquido",
+        "Total Venda","Valor Total"
+    ])
+    cq=_local_col(b,[
+        "Itens","Item","Quantidade","Qtd","QTD","Qtde",
+        "Quantidade Vendida","Qtd Vendida","Unidades"
+    ])
+    cc=_local_col(b,[
+        "Ano-mês","Ano-mes","Ano Mes","Ano_Mes","Competência","Competencia",
+        "Mês","Mes","Data Venda","Data_Venda","Data"
+    ])
+    if not ce or not cv or not cq or not cc:
+        return vazio
+
+    b["EAN"]=_ean(b[ce])
+    b["__venda_v158"]=_num(b[cv])
+    b["__itens_v158"]=_num(b[cq])
+
+    s=b[cc]
+    txt=s.astype(str).str.strip()
+    ext=txt.str.extract(r"(20\d{2})\D*([01]\d)")
+    comp=pd.Series(np.nan,index=b.index,dtype="float64")
+    ok=ext[0].notna() & ext[1].notna()
+    comp.loc[ok]=(
+        pd.to_numeric(ext.loc[ok,0],errors="coerce")*100
+        + pd.to_numeric(ext.loc[ok,1],errors="coerce")
+    )
+    faltou=comp.isna()
+    if faltou.any():
+        dt=pd.to_datetime(s.loc[faltou],errors="coerce",dayfirst=True,format="mixed")
+        comp.loc[faltou]=np.where(
+            dt.notna(),dt.dt.year*100+dt.dt.month,np.nan
+        )
+    b["__comp_v158"]=pd.to_numeric(comp,errors="coerce")
+
+    hoje=pd.Timestamp.now()
+    mes_atual=hoje.year*100+hoje.month
+    b=b[
+        b["EAN"].ne("")
+        & b["__venda_v158"].gt(0)
+        & b["__itens_v158"].gt(0)
+        & b["__comp_v158"].notna()
+        & b["__comp_v158"].lt(mes_atual)
+    ].copy()
+    if b.empty:
+        return vazio
+
+    mensal=(
+        b.groupby(["EAN","__comp_v158"],as_index=False)
+        .agg(
+            Venda_Mes_Fechado=("__venda_v158","sum"),
+            Itens_Mes_Fechado=("__itens_v158","sum")
+        )
+    )
+    mensal=mensal[
+        mensal["Venda_Mes_Fechado"].gt(0)
+        & mensal["Itens_Mes_Fechado"].gt(0)
+    ].copy()
+    if mensal.empty:
+        return vazio
+
+    mensal=mensal.sort_values(["EAN","__comp_v158"],kind="stable")
+    ult=mensal.groupby("EAN",sort=False).tail(1).copy()
+    ult["Mes_Fechado_Referencia"]=ult["__comp_v158"].apply(
+        lambda x:f"{int(x)//100:04d}-{int(x)%100:02d}"
+    )
+    ult["Preco_Fallback_Mes_Fechado"]=(
+        ult["Venda_Mes_Fechado"]/
+        ult["Itens_Mes_Fechado"].replace(0,np.nan)
+    )
+    return ult[[
+        "EAN","Venda_Mes_Fechado","Itens_Mes_Fechado",
+        "Mes_Fechado_Referencia","Preco_Fallback_Mes_Fechado"
+    ]].reset_index(drop=True)
+
+
+def recalcular_ganho_inteligente(df_base, venda_rede_base, historico_base):
+    """
+    V1.4.58 — simulador independente de funções definidas depois da carga inicial.
+    Corrige o NameError no Streamlit Cloud e mantém a regra aprovada.
+    """
+    if not isinstance(df_base,pd.DataFrame) or df_base.empty:
+        return (
+            df_base.copy() if isinstance(df_base,pd.DataFrame) else pd.DataFrame(),
+            pd.DataFrame(),
+            "sem_base"
+        )
+
+    df_calc=df_base.copy()
+    df_calc.columns=df_calc.columns.astype(str).str.strip()
+
+    def _local_col(df,candidatos):
+        norm={re.sub(r"[^a-z0-9]","",str(c).lower()):c for c in df.columns}
+        for cand in candidatos:
+            k=re.sub(r"[^a-z0-9]","",str(cand).lower())
+            if k in norm:
+                return norm[k]
+        return None
+
+    ce_base=_local_col(df_calc,["EAN","EAN (GTIN)","GTIN","Código de Barras","Codigo de Barras"])
+    if not ce_base:
+        return df_calc,pd.DataFrame(),"sem_ean_base"
+    df_calc["EAN"]=_ean(df_calc[ce_base])
+
+    # Último mês fechado por EAN diretamente da VENDA_FINAL_TESTE em memória.
+    fechado=eirox_v158_ultimo_mes_fechado_memoria(venda_rede_base)
+    if fechado.empty:
+        return df_calc,pd.DataFrame(),"sem_base_mensal_fechada"
+
+    # Preço atual prioritário: VENDA_TESTE / Principal pela última Data Emissão.
+    pesquisa=eirox_v143_ultima_pesquisa()
+    atual=pd.DataFrame(columns=["EAN","Preco_Atual","Data_Ultima_Venda"])
+    if isinstance(pesquisa,pd.DataFrame) and not pesquisa.empty:
+        p=pesquisa.copy()
+        p["EAN"]=_ean(p["EAN"])
+        atual=p[["EAN","Preco_Ultima_Venda","Data_Ultima_Venda"]].copy()
+        atual=atual.rename(columns={"Preco_Ultima_Venda":"Preco_Atual"})
+        atual=atual.drop_duplicates("EAN",keep="last")
+
+    # Fallback: Venda / Itens do último mês fechado.
+    preco_fallback=fechado[[
+        "EAN","Preco_Fallback_Mes_Fechado","Mes_Fechado_Referencia"
+    ]].drop_duplicates("EAN",keep="last").copy()
+
+    mapa=preco_fallback.merge(atual,on="EAN",how="left")
+    pa=pd.to_numeric(mapa["Preco_Atual"],errors="coerce")
+    fb=pd.to_numeric(mapa["Preco_Fallback_Mes_Fechado"],errors="coerce")
+    mapa["Preco_Atual_Final"]=pa.where(pa.notna() & pa.gt(0),fb)
+    mapa["Fonte_Preco"]=np.where(
+        pa.notna() & pa.gt(0),"ÚLTIMA VENDA","ÚLTIMO MÊS FECHADO"
+    )
+
+    # Preço sugerido/referência competitiva pelo histórico de pesquisa.
+    hist=historico_base.copy() if isinstance(historico_base,pd.DataFrame) else pd.DataFrame()
+    if hist.empty:
+        return df_calc,pd.DataFrame(),"sem_historico_pesquisa"
+    hist.columns=hist.columns.astype(str).str.strip()
+
+    ce_hist=_local_col(hist,["EAN","EAN (GTIN)","GTIN","Código de Barras","Codigo de Barras"])
+    cp_hist=_local_col(hist,["Preço (R$)","Preco (R$)","Preço","Preco","Valor"])
+    cprod_hist=_local_col(hist,["Produto","Descrição","Descricao","Termo Pesquisado"])
+    crede_hist=_local_col(hist,["Rede","Rede Concorrente","Bandeira","Grupo","Concorrente"])
+    clo_hist=_local_col(hist,["Farmácia","Farmacia","Loja","Estabelecimento"])
+    cdata_hist=_local_col(hist,["Data","Data Pesquisa","Data da Pesquisa","Dt Pesquisa","Data_Hora","Data Hora"])
+    if not ce_hist or not cp_hist:
+        return df_calc,pd.DataFrame(),"historico_sem_colunas"
+
+    hist["EAN"]=_ean(hist[ce_hist])
+    hist["__preco_v158"]=_num(hist[cp_hist])
+    hist=hist[
+        hist["EAN"].ne("")
+        & hist["__preco_v158"].gt(0)
+        & hist["__preco_v158"].le(5000)
+    ].copy()
+    if hist.empty:
+        return df_calc,pd.DataFrame(),"historico_sem_preco"
+
+    mercado=(
+        hist.groupby("EAN")["__preco_v158"]
+        .apply(preco_referencia_seguro)
+        .reset_index()
+        .rename(columns={"__preco_v158":"Preco_Sugerido_Mercado"})
+    )
+
+    # Metadados do preço de referência e do menor preço.
+    hist_ref=hist.merge(mercado,on="EAN",how="left")
+    hist_ref["__dif_ref_v158"]=(
+        hist_ref["__preco_v158"]-hist_ref["Preco_Sugerido_Mercado"]
+    ).abs()
+
+    idx_ref=hist_ref.groupby("EAN")["__dif_ref_v158"].idxmin()
+    idx_min=hist_ref.groupby("EAN")["__preco_v158"].idxmin()
+
+    ref=hist_ref.loc[idx_ref].copy()
+    mn=hist_ref.loc[idx_min].copy()
+
+    meta=pd.DataFrame({"EAN":ref["EAN"].astype(str)})
+    meta["Rede_Preco_Maximo_Competitivo"]=(
+        ref[crede_hist].astype(str) if crede_hist else
+        (ref[clo_hist].astype(str) if clo_hist else "")
+    )
+    meta["Data_Preco_Maximo_Competitivo"]=ref[cdata_hist] if cdata_hist else ""
+
+    meta_min=pd.DataFrame({"EAN":mn["EAN"].astype(str)})
+    meta_min["Menor_Preco"]=mn["__preco_v158"]
+    meta_min["Rede_Menor_Preco"]=(
+        mn[crede_hist].astype(str) if crede_hist else
+        (mn[clo_hist].astype(str) if clo_hist else "")
+    )
+    meta_min["Data_Menor_Preco"]=mn[cdata_hist] if cdata_hist else ""
+
+    # Produto: prioriza base mestre, depois histórico.
+    produto=pd.DataFrame({"EAN":df_calc["EAN"]})
+    cprod_base=_local_col(df_calc,["Produto","Descrição","Descricao"])
+    if cprod_base:
+        produto["Produto_Simulador"]=df_calc[cprod_base].astype(str)
+    elif cprod_hist:
+        prod_hist=(
+            hist.groupby("EAN")[cprod_hist]
+            .first()
+            .reset_index()
+            .rename(columns={cprod_hist:"Produto_Simulador"})
+        )
+        produto=produto[["EAN"]].drop_duplicates().merge(prod_hist,on="EAN",how="left")
+    produto=produto.drop_duplicates("EAN",keep="first")
+
+    sim=(
+        fechado.merge(mapa[["EAN","Preco_Atual_Final","Fonte_Preco","Data_Ultima_Venda"]],on="EAN",how="left")
+        .merge(mercado,on="EAN",how="inner")
+        .merge(produto,on="EAN",how="left")
+        .merge(meta,on="EAN",how="left")
+        .merge(meta_min,on="EAN",how="left")
+    )
+
+    p=pd.to_numeric(sim["Preco_Atual_Final"],errors="coerce")
+    s=pd.to_numeric(sim["Preco_Sugerido_Mercado"],errors="coerce")
+    q=pd.to_numeric(sim["Itens_Mes_Fechado"],errors="coerce")
+    venda=pd.to_numeric(sim["Venda_Mes_Fechado"],errors="coerce")
+
+    mask=p.gt(0) & s.gt(p) & q.gt(0) & venda.gt(0)
+    sim=sim.loc[mask].copy()
+    if sim.empty:
+        return df_calc,pd.DataFrame(),"sem_gap_positivo"
+
+    p=pd.to_numeric(sim["Preco_Atual_Final"],errors="coerce")
+    s=pd.to_numeric(sim["Preco_Sugerido_Mercado"],errors="coerce")
+    q=pd.to_numeric(sim["Itens_Mes_Fechado"],errors="coerce")
+
+    sim["Qtd_Vendida_Mes_Anterior"]=q
+    sim["Preco_Atual"]=p
+    sim["Venda_Real_Mes_Fechado"]=pd.to_numeric(sim["Venda_Mes_Fechado"],errors="coerce")
+    sim["Venda_Preco_Antigo"]=(p*q).round(2)
+    sim["Venda_Projetada_Preco_Sugerido"]=(s*q).round(2)
+    sim["Ganho_Unitario"]=(s-p).round(2)
+    sim["Ganho_Potencial_Simulador"]=(sim["Ganho_Unitario"]*q).round(2)
+
+    ganho=(
+        sim.groupby("EAN",as_index=False)["Ganho_Potencial_Simulador"]
+        .sum()
+        .rename(columns={"Ganho_Potencial_Simulador":"Ganho_Potencial_Reconciliado"})
+    )
+    base_out=df_calc.merge(ganho,on="EAN",how="left")
+    base_out["Ganho_Potencial"]=pd.to_numeric(
+        base_out["Ganho_Potencial_Reconciliado"],errors="coerce"
+    ).fillna(0)
+    base_out["Ganho_Potencial_Atualizado"]=base_out["Ganho_Potencial"]
+    base_out["Ganho_Potencial_Final"]=base_out["Ganho_Potencial"]
+
+    manter=[
+        "EAN","Produto_Simulador","Mes_Fechado_Referencia",
+        "Qtd_Vendida_Mes_Anterior","Venda_Real_Mes_Fechado",
+        "Venda_Preco_Antigo","Preco_Atual","Preco_Sugerido_Mercado",
+        "Venda_Projetada_Preco_Sugerido","Ganho_Unitario",
+        "Ganho_Potencial_Simulador","Fonte_Preco","Data_Ultima_Venda",
+        "Menor_Preco","Rede_Menor_Preco","Data_Menor_Preco",
+        "Rede_Preco_Maximo_Competitivo","Data_Preco_Maximo_Competitivo"
+    ]
+    sim=sim[[c for c in manter if c in sim.columns]].copy()
+    return base_out,sim.reset_index(drop=True),"simulador_v158_ok"
+
+
+
+
+
 
 
 
@@ -8868,16 +10123,16 @@ def criar_simulacao_por_historico(historico_base):
     if base.empty:
         return pd.DataFrame()
 
-    simulacao = (
-        base
-        .groupby("EAN")
-        .agg(
-            Qtd_Vendida_Mes_Anterior=("Preco_Base", "count"),
-            Preco_Atual=("Preco_Base", "mean"),
-            Preco_Sugerido_Mercado=("Preco_Base", _preco_ref_seguro)
-        )
-        .reset_index()
+    _qtd_hist = base.groupby("EAN", as_index=False).agg(
+        Qtd_Vendida_Mes_Anterior=("Preco_Base", "count"),
+        Preco_Sugerido_Mercado=("Preco_Base", _preco_ref_seguro)
     )
+    # Fallback histórico também respeita última ocorrência/data, nunca média.
+    _ult_hist = eirox_ultima_venda_por_ean(
+        base, "EAN", preco_col="Preco_Base"
+    )
+    simulacao = _qtd_hist.merge(_ult_hist[["EAN", "Preco_Ultima_Venda"]], on="EAN", how="left")
+    simulacao = simulacao.rename(columns={"Preco_Ultima_Venda": "Preco_Atual"})
 
     if col_produto:
         produto_ref = (
@@ -9330,11 +10585,11 @@ def _cluster2_calcular_sugestoes(base_cluster, loja_ref, raio_km=2.0):
         )
 
         if not principal_loja_ref.empty:
-            atual = (
-                principal_loja_ref
-                .groupby("EAN", dropna=False)
-                .agg(Preço_Atual_Principal=("Preço", "mean"))
-                .reset_index()
+            _ult_cluster = eirox_ultima_venda_por_ean(
+                principal_loja_ref, "EAN", preco_col="Preço"
+            )
+            atual = _ult_cluster[["EAN", "Preco_Ultima_Venda"]].rename(
+                columns={"Preco_Ultima_Venda": "Preço_Atual_Principal"}
             )
 
             sugestao = sugestao.merge(atual, on="EAN", how="left")
@@ -10247,7 +11502,7 @@ def _backup_arquivos_alvo():
         "dashboard_pricing.py",
         "pricing_utils.py",
         "style.css",
-        "logo insightfarma.png",
+        EIROX_CLIENT_PROFILE["logo"],
         "IGNORADO_Analise_Pricing.xlsx",
         "VENDA_TESTE",
         "VENDA_FINAL_TESTE",
@@ -11814,8 +13069,11 @@ def salvar_oportunidades(oportunidades_df):
 
 
 def gerar_motor_oportunidades(top_n=100, margem_minima=20, apenas_oportunidade_positiva=True):
+    """V1.4.55 — Motor de Oportunidades alinhado ao motor financeiro central."""
     try:
-        base = globals().get("df", pd.DataFrame())
+        base = globals().get("df_filtrado", pd.DataFrame())
+        if not isinstance(base, pd.DataFrame) or base.empty:
+            base = globals().get("df", pd.DataFrame())
         if not isinstance(base, pd.DataFrame) or base.empty:
             base = globals().get("base_pesquisa", pd.DataFrame())
         if not isinstance(base, pd.DataFrame) or base.empty:
@@ -11828,111 +13086,107 @@ def gerar_motor_oportunidades(top_n=100, margem_minima=20, apenas_oportunidade_p
         except Exception:
             pass
 
+        motor = eirox_motor_oportunidades(base)
+        if not isinstance(motor, pd.DataFrame) or motor.empty:
+            return pd.DataFrame()
+
         empresa_id = empresa_contexto_atual() if "empresa_contexto_atual" in globals() else "1"
         empresa_nome = obter_nome_empresa(empresa_id) if "obter_nome_empresa" in globals() else ""
 
-        col_ean = _oport_coluna(base, ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras"])
-        col_prod = _oport_coluna(base, ["Produto", "Produto_Base_SIM", "Descrição", "Descricao"])
-        col_lab = _oport_coluna(base, ["Laboratório", "Laboratorio", "Fabricante", "Fornecedor"])
-        col_cat = _oport_coluna(base, ["Categoria", "Família", "Familia", "Departamento", "Classe"])
-        col_ganho = _oport_coluna(base, ["Ganho_Potencial", "Potencial de Captura", "Oportunidade", "Potencial"])
-        col_fat = _oport_coluna(base, ["Faturamento", "Venda", "Receita", "Faturamento_Total"])
-        col_margem = _oport_coluna(base, ["Margem_%", "Margem", "Margem %"])
-        col_preco = _oport_coluna(base, ["Preco_Rede", "Preço Rede", "Preco_Venda", "Preço (R$)", "Preço"])
-        col_custo = _oport_coluna(base, ["Custo", "Custo Médio", "Custo_Medio", "Custo Atual"])
-        col_qtd = _oport_coluna(base, ["Quantidade", "Qtd", "Qtde", "Unidades", "Volume"])
-        col_estoque = _oport_coluna(base, ["Estoque", "Estoque Atual", "Qtde Estoque"])
-        col_conc = _oport_coluna(base, ["Menor_Preco_Concorrente", "Menor Concorrente", "Preco_Concorrente", "Preço Concorrente", "Menor_Preco"])
+        c_ean = _eirox_first_col(motor, ["EAN","EAN (GTIN)","GTIN","Código de Barras"])
+        c_prod = _eirox_first_col(motor, ["Produto","Produto_Base_SIM","Descrição","Descricao"])
+        c_lab = _eirox_first_col(motor, ["Laboratório","Laboratorio","Fabricante","Fornecedor"])
+        c_cat = _eirox_first_col(motor, ["Categoria","Família","Familia","Departamento","Classe"])
+        c_estoque = _eirox_first_col(motor, ["Estoque","Estoque Atual","Qtde Estoque","Quantidade Estoque"])
 
-        trabalho = pd.DataFrame(index=base.index)
-        trabalho["EmpresaID"] = empresa_id
-        trabalho["Empresa"] = empresa_nome
-        trabalho["EAN"] = base[col_ean].astype(str) if col_ean else ""
-        trabalho["Produto"] = base[col_prod].astype(str) if col_prod else ""
-        trabalho["Laboratório"] = base[col_lab].astype(str) if col_lab else "Não informado"
-        trabalho["Categoria"] = base[col_cat].astype(str) if col_cat else "Não informado"
+        rec = motor["Recomendacao_Central"].fillna("MANTER").astype(str)
+        preco = pd.to_numeric(motor["Preço_Atual_Eirox"],errors="coerce")
+        mercado = pd.to_numeric(motor["Preço_Mercado_Eirox"],errors="coerce")
+        custo = pd.to_numeric(motor["Custo_Unitario_Eirox"],errors="coerce")
+        qtd = pd.to_numeric(motor.get("Qtd_Vendida_Eirox",0),errors="coerce").fillna(0)
 
-        if col_ganho:
-            trabalho["Ganho_Potencial"] = _oport_converter_numero(base[col_ganho]).fillna(0)
-        else:
-            preco = _oport_converter_numero(base[col_preco]).fillna(0) if col_preco else pd.Series([0] * len(base), index=base.index)
-            qtd = _oport_converter_numero(base[col_qtd]).fillna(1) if col_qtd else pd.Series([1] * len(base), index=base.index)
-            margem = _oport_converter_numero(base[col_margem]).fillna(0) if col_margem else pd.Series([0] * len(base), index=base.index)
-            fator = 0.03
-            ajuste_margem = (float(margem_minima) - margem).clip(lower=0) / 100
-            trabalho["Ganho_Potencial"] = (preco * qtd * (fator + ajuste_margem)).fillna(0)
+        ganho = pd.Series(0.0,index=motor.index)
+        msub = rec.eq("SUBIR PREÇO")
+        if "Ganho_Lucro_Potencial_Eirox" in motor.columns:
+            ganho.loc[msub] = pd.to_numeric(
+                motor.loc[msub,"Ganho_Lucro_Potencial_Eirox"],errors="coerce"
+            ).fillna(0)
 
-        trabalho["Faturamento"] = _oport_converter_numero(base[col_fat]).fillna(0) if col_fat else 0
-        trabalho["Margem_%"] = _oport_converter_numero(base[col_margem]).fillna(0) if col_margem else 0
-        trabalho["Preço_Rede"] = _oport_converter_numero(base[col_preco]).fillna(0) if col_preco else 0
-        trabalho["Custo"] = _oport_converter_numero(base[col_custo]).fillna(0) if col_custo else 0
-        trabalho["Estoque"] = _oport_converter_numero(base[col_estoque]).fillna(0) if col_estoque else 0
-        trabalho["Preço_Concorrente"] = _oport_converter_numero(base[col_conc]).fillna(0) if col_conc else 0
+        mneg = rec.eq("NEGOCIAR COMPRA")
+        if "Impacto_Financeiro_Eirox" in motor.columns:
+            ganho.loc[mneg] = pd.to_numeric(
+                motor.loc[mneg,"Impacto_Financeiro_Eirox"],errors="coerce"
+            ).fillna(0)
 
-        def classificar(row):
-            ganho = float(row.get("Ganho_Potencial", 0) or 0)
-            margem = float(row.get("Margem_%", 0) or 0)
-            estoque = float(row.get("Estoque", 0) or 0)
-            preco = float(row.get("Preço_Rede", 0) or 0)
-            conc = float(row.get("Preço_Concorrente", 0) or 0)
-            if ganho > 0 and margem < float(margem_minima):
-                return "Recuperar margem"
-            if ganho > 0 and conc > 0 and preco > conc:
-                return "Revisar competitividade"
-            if ganho > 0 and estoque > 50:
-                return "Giro de estoque"
-            if ganho > 0:
-                return "Ganho potencial"
-            return "Monitorar"
+        out = pd.DataFrame(index=motor.index)
+        out["EmpresaID"] = empresa_id
+        out["Empresa"] = empresa_nome
+        out["EAN"] = motor[c_ean].astype(str) if c_ean else ""
+        out["Produto"] = motor[c_prod].astype(str) if c_prod else ""
+        out["Laboratório"] = motor[c_lab].astype(str) if c_lab else "Não informado"
+        out["Categoria"] = motor[c_cat].astype(str) if c_cat else "Não informado"
+        out["Ganho_Potencial"] = ganho.clip(lower=0)
+        out["Faturamento"] = (preco.fillna(0) * qtd).round(2)
+        out["Margem_Media"] = pd.to_numeric(motor["Margem_Atual_Eirox"],errors="coerce") * 100
+        out["Estoque_Total"] = pd.to_numeric(motor[c_estoque],errors="coerce").fillna(0) if c_estoque else 0
+        out["Preco_Medio"] = preco
+        out["Concorrente_Medio"] = mercado
+        out["Tipo_Oportunidade"] = rec.map({
+            "SUBIR PREÇO":"Ganho potencial",
+            "BAIXAR PREÇO":"Revisar competitividade",
+            "NEGOCIAR COMPRA":"Recuperar margem",
+            "SEM CUSTO":"Revisar cadastro",
+            "MANTER":"Monitorar",
+        }).fillna("Monitorar")
+        out["Ação_Sugerida"] = rec.map({
+            "SUBIR PREÇO":"Aumentar preço preservando competitividade.",
+            "BAIXAR PREÇO":"Revisar redução de preço preservando margem.",
+            "NEGOCIAR COMPRA":"Negociar custo com o fornecedor.",
+            "SEM CUSTO":"Sanear custo antes de recomendar preço.",
+            "MANTER":"Manter acompanhamento.",
+        }).fillna("Manter acompanhamento.")
 
-        trabalho["Tipo_Oportunidade"] = trabalho.apply(classificar, axis=1)
+        # Ganho positivo significa captura financeira; BAIXAR é impacto, não ganho.
+        if apenas_oportunidade_positiva:
+            out = out[out["Ganho_Potencial"].gt(0)].copy()
 
-        def acao(row):
-            tipo = row.get("Tipo_Oportunidade", "")
-            if tipo == "Recuperar margem":
-                return "Avaliar preço, custo e negociação com fornecedor."
-            if tipo == "Revisar competitividade":
-                return "Simular ajuste de preço com base no concorrente."
-            if tipo == "Giro de estoque":
-                return "Avaliar ação comercial para acelerar giro."
-            if tipo == "Ganho potencial":
-                return "Priorizar análise no simulador inteligente."
-            return "Manter acompanhamento."
-
-        trabalho["Ação_Sugerida"] = trabalho.apply(acao, axis=1)
-
-        agrup_cols = ["EmpresaID", "Empresa", "EAN", "Produto", "Laboratório", "Categoria"]
-        trabalho = (
-            trabalho.groupby(agrup_cols, dropna=False)
+        out = (
+            out.groupby(
+                ["EmpresaID","Empresa","EAN","Produto","Laboratório","Categoria"],
+                dropna=False
+            )
             .agg(
-                Ganho_Potencial=("Ganho_Potencial", "sum"),
-                Faturamento=("Faturamento", "sum"),
-                Margem_Media=("Margem_%", "mean"),
-                Estoque_Total=("Estoque", "sum"),
-                Preco_Medio=("Preço_Rede", "mean"),
-                Concorrente_Medio=("Preço_Concorrente", "mean"),
-                Tipo_Oportunidade=("Tipo_Oportunidade", "first"),
-                Ação_Sugerida=("Ação_Sugerida", "first")
+                Ganho_Potencial=("Ganho_Potencial","sum"),
+                Faturamento=("Faturamento","sum"),
+                Margem_Media=("Margem_Media","mean"),
+                Estoque_Total=("Estoque_Total","sum"),
+                Preco_Medio=("Preco_Medio","mean"),
+                Concorrente_Medio=("Concorrente_Medio","mean"),
+                Tipo_Oportunidade=("Tipo_Oportunidade","first"),
+                Ação_Sugerida=("Ação_Sugerida","first"),
             )
             .reset_index()
         )
+        out = out.sort_values("Ganho_Potencial",ascending=False)
+        if top_n is not None and int(top_n) > 0:
+            out = out.head(int(top_n))
+        out["Ranking"] = range(1,len(out)+1)
 
-        if apenas_oportunidade_positiva:
-            trabalho = trabalho[trabalho["Ganho_Potencial"] > 0]
-
-        trabalho = trabalho.sort_values("Ganho_Potencial", ascending=False).head(int(top_n))
-        trabalho["Ranking"] = range(1, len(trabalho) + 1)
-
-        cols = ["Ranking", "EmpresaID", "Empresa", "EAN", "Produto", "Laboratório", "Categoria", "Ganho_Potencial", "Faturamento", "Margem_Media", "Estoque_Total", "Preco_Medio", "Concorrente_Medio", "Tipo_Oportunidade", "Ação_Sugerida"]
-        return trabalho[cols].copy()
+        cols=[
+            "Ranking","EmpresaID","Empresa","EAN","Produto","Laboratório","Categoria",
+            "Ganho_Potencial","Faturamento","Margem_Media","Estoque_Total",
+            "Preco_Medio","Concorrente_Medio","Tipo_Oportunidade","Ação_Sugerida"
+        ]
+        return out[cols].copy()
 
     except Exception as erro:
         return pd.DataFrame([{
-            "Ranking": 1, "EmpresaID": empresa_contexto_atual() if "empresa_contexto_atual" in globals() else "1",
-            "Empresa": "", "EAN": "", "Produto": "", "Laboratório": "", "Categoria": "",
-            "Ganho_Potencial": 0, "Faturamento": 0, "Margem_Media": 0, "Estoque_Total": 0,
-            "Preco_Medio": 0, "Concorrente_Medio": 0, "Tipo_Oportunidade": "Erro", "Ação_Sugerida": str(erro)
+            "Ranking":1,"EmpresaID":"","Empresa":"","EAN":"","Produto":"",
+            "Laboratório":"","Categoria":"","Ganho_Potencial":0,"Faturamento":0,
+            "Margem_Media":0,"Estoque_Total":0,"Preco_Medio":0,"Concorrente_Medio":0,
+            "Tipo_Oportunidade":"Erro","Ação_Sugerida":str(erro)
         }])
+
 
 
 def enviar_oportunidades_telegram(oportunidades_df, limite_envio=10):
@@ -11941,17 +13195,22 @@ def enviar_oportunidades_telegram(oportunidades_df, limite_envio=10):
             return False, "Nenhuma oportunidade para enviar."
 
         top = oportunidades_df.head(int(limite_envio))
-        ganho_total = oportunidades_df_filtrado["Ganho_Potencial"].sum() if "Ganho_Potencial" in oportunidades_df.columns else 0
+        ganho_total = (
+            pd.to_numeric(oportunidades_df["Ganho_Potencial"],errors="coerce").fillna(0).sum()
+            if "Ganho_Potencial" in oportunidades_df.columns else 0
+        )
 
         linhas = []
         for _, row in top.iterrows():
-            linhas.append(f"• <b>{row.get('Produto', '')}</b> | R$ {_oport_numero_br(row.get('Ganho_Potencial', 0))}")
+            linhas.append(
+                f"• <b>{row.get('Produto','')}</b> | {eirox_brl(row.get('Ganho_Potencial',0), vazio='R$ 0,00')}"
+            )
 
         mensagem = (
             "💰 <b>Motor de Oportunidades Eirox</b>\n\n"
-            f"🏢 <b>Empresa:</b> {top.iloc[0].get('Empresa', '')}\n"
+            f"🏢 <b>Empresa:</b> {top.iloc[0].get('Empresa','')}\n"
             f"🎯 <b>Oportunidades:</b> {len(oportunidades_df)}\n"
-            f"💵 <b>Ganho potencial:</b> R$ {_oport_numero_br(ganho_total)}\n"
+            f"💵 <b>Ganho potencial:</b> {eirox_brl(ganho_total, vazio='R$ 0,00')}\n"
             f"🕒 <b>Horário:</b> {_oport_data_hora()}\n\n"
             + "\n".join(linhas)
             + f"\n\n🏷️ <b>Versão:</b> {VERSAO_APP}"
@@ -11961,6 +13220,7 @@ def enviar_oportunidades_telegram(oportunidades_df, limite_envio=10):
         return bool(ok), "Oportunidades enviadas ao Telegram." if ok else "Não foi possível enviar ao Telegram."
     except Exception as erro:
         return False, str(erro)
+
 
 
 def usuario_pode_ver_motor_oportunidades():
@@ -12540,14 +13800,7 @@ def gerar_ia_pricing_enterprise(margem_minima=25, margem_alvo=35, limite_reducao
             motor.loc[mask_outros, "Impacto_Financeiro_Eirox"], errors="coerce"
         ).fillna(0)
 
-        # Fallback histórico quando não houver volume, sem zerar oportunidade já calculada.
-        c_ganho_hist = _eirox_first_col(
-            motor,
-            ["Ganho_Potencial", "Ganho Potencial", "Ganho_Potencial_Final", "Ganho_Potencial_Atualizado", "Ganho Produto"]
-        )
-        if c_ganho_hist:
-            ganho_hist = pd.to_numeric(motor[c_ganho_hist], errors="coerce").fillna(0)
-            ganho = ganho.where(ganho.abs() > 0, ganho_hist)
+        # V1.4.55 — sem fallback histórico: IA usa apenas o motor financeiro atual.
 
         mapa_acao = {
             "SUBIR PREÇO": "Aumentar preço",
@@ -13238,7 +14491,7 @@ def filtrar_paginas_por_plano(paginas):
 
         plano = plano_empresa_contexto()
 
-        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a InsightFarma', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
+        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a InsightFarma', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Central de Qualidade', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
 
         # Garante que todas as páginas de cliente existentes entrem no menu conforme o plano.
         todas_paginas_cliente = ["⚖️ Cliente x Principal Concorrente", '🏢 Portal do Cliente', '📋 Workflow Comercial', '🤖 IA Pricing Enterprise', '🏢 Dashboard Executivo', '🌎 Mapa Geográfico de Concorrência', '🔎 Rede/Loja vs Concorrentes']
@@ -14916,7 +16169,7 @@ def tela_login():
         try:
             _login_logo_cols = st.columns([1.0, 1.55, 1.0])
             with _login_logo_cols[1]:
-                st.image("logo insightfarma.png", use_container_width=True)
+                st.image(EIROX_CLIENT_PROFILE["logo"], use_container_width=True)
         except Exception:
             pass
 
@@ -15097,7 +16350,7 @@ st.download_button = download_button_controlado
 try:
 
     st.image(
-        "logo insightfarma.png",
+        EIROX_CLIENT_PROFILE["logo"],
     )
 
 except:
@@ -15119,7 +16372,7 @@ st.markdown(
 # ENGINE ÚNICA CACHEADA - PERFORMANCE ENTERPRISE
 # --------------------------------------------------
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_resource(show_spinner=False, max_entries=8)
 def eirox_processar_base_master_cacheada(
     assinatura_historico,
     assinatura_compra,
@@ -15151,10 +16404,13 @@ def eirox_processar_base_master_cacheada(
     base = aplicar_engine_recomendacoes_restaurada(base)
     base = aplicar_regra_rede_menor_preco(base)
     base = corrigir_lab_familia_recomendacoes(base, _compra_base, _estoque_base)
+    # V1.4.66 — custo oficial reaplicado no final da preparação cacheada.
+    base = aplicar_custo_oficial_estoque_teste(base, _estoque_base)
+    base = aplicar_engine_recomendacoes_restaurada(base)
     return base
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_resource(show_spinner=False, max_entries=12)
 def eirox_preprocessar_historico_cacheado(
     assinatura_historico,
     assinatura_contexto,
@@ -15167,7 +16423,7 @@ def eirox_preprocessar_historico_cacheado(
     return out
 
 
-@st.cache_data(show_spinner=False, max_entries=12)
+@st.cache_resource(show_spinner=False, max_entries=24)
 def eirox_classificar_base_cacheada(
     tipo_base,
     assinatura_base,
@@ -15178,7 +16434,7 @@ def eirox_classificar_base_cacheada(
     return aplicar_classificacao_principal_concorrente(_base, tipo_base)
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_resource(show_spinner=False, max_entries=12)
 def eirox_recalcular_ganho_cacheado(
     assinatura_master,
     assinatura_venda,
@@ -15192,7 +16448,7 @@ def eirox_recalcular_ganho_cacheado(
     return recalcular_ganho_inteligente(_df_base, _venda_rede_base, _historico_base)
 
 
-@st.cache_data(show_spinner=False, max_entries=24)
+@st.cache_resource(show_spinner=False, max_entries=32)
 def eirox_pipeline_municipio_cacheado(
     municipio,
     assinatura_master,
@@ -15214,7 +16470,7 @@ def eirox_pipeline_municipio_cacheado(
     )
 
 
-@st.cache_data(show_spinner=False, max_entries=32)
+@st.cache_resource(show_spinner=False, max_entries=48)
 def eirox_menor_preco_cacheado(
     chave_filtros,
     assinatura_historico,
@@ -15280,7 +16536,8 @@ eirox_limpar_cache_persistente_antigo()
 # --------------------------------------------------
 # CACHE PERSISTENTE DE ENTRADA - V1.4.36
 # --------------------------------------------------
-def eirox_carregar_base_persistente(rotulo, assinatura, loader):
+@st.cache_resource(show_spinner=False, max_entries=16)
+def eirox_carregar_base_persistente(rotulo, assinatura, _loader):
     """Evita reler Excel/CSV a cada nova sessão quando os arquivos não mudaram."""
     pasta = Path(__file__).resolve().parent / "_cache_pricing"
     pasta.mkdir(parents=True, exist_ok=True)
@@ -15296,13 +16553,1721 @@ def eirox_carregar_base_persistente(rotulo, assinatura, loader):
             arq.unlink(missing_ok=True)
         except Exception:
             pass
-    obj = loader()
+    obj = _loader()
     try:
         if isinstance(obj, pd.DataFrame):
             obj.to_pickle(arq)
     except Exception:
         pass
     return obj
+
+
+
+# ==========================================================
+# EIROX PRICING 2.0 — FASE 2
+# CAMADA OFICIAL DE DADOS E REGRAS
+# ==========================================================
+def eirox_v210_serie_numerica(base, nomes):
+    s = pd.Series(np.nan, index=base.index, dtype="float64")
+    for nome in nomes:
+        if nome in base.columns:
+            atual = pd.to_numeric(base[nome], errors="coerce")
+            s = s.where(s.notna() & s.gt(0), atual)
+    return s
+
+
+def eirox_v210_serie_texto(base, nomes, padrao=""):
+    s = pd.Series("", index=base.index, dtype="object")
+    for nome in nomes:
+        if nome in base.columns:
+            atual = base[nome].fillna("").astype(str).str.strip()
+            s = s.where(s.astype(str).str.strip().ne(""), atual)
+    if padrao:
+        s = s.where(s.astype(str).str.strip().ne(""), padrao)
+    return s
+
+
+def eirox_v210_normalizar_ean(serie):
+    return (
+        serie.fillna("").astype(str)
+        .str.replace(".0", "", regex=False)
+        .str.replace(r"\D", "", regex=True)
+        .str.strip()
+    )
+
+
+def eirox_v210_aplicar_camada_oficial(base, historico_base=None, venda_base=None):
+    """
+    Camada única e rastreável de verdade do Pricing.
+
+    Não cria novas regras comerciais. Apenas consolida as regras já aprovadas:
+      Preço: VENDA_TESTE Principal -> último mês fechado com venda.
+      Custo: ESTOQUE_TESTE -> VENDA_FINAL_TESTE.
+      Mercado: menor concorrente com preço/loja/data da mesma ocorrência.
+      Volume: último mês fechado com venda por EAN.
+      Recomendação/Ganho: preserva o motor central vigente.
+    """
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return base
+
+    d = base.copy()
+
+    # 1) PREÇO OFICIAL — reutiliza o motor canônico já existente.
+    try:
+        d = eirox_v143_aplicar_preco(d)
+    except Exception:
+        pass
+
+    # 2) MERCADO OFICIAL — mantém preço, loja e data da mesma ocorrência.
+    try:
+        d = eirox_enriquecer_menor_preco_concorrente(
+            d,
+            historico_base=historico_base,
+        )
+    except Exception:
+        pass
+
+    # EAN oficial.
+    ce = eirox_coluna_generica(
+        d,
+        ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras", "Codigo de Barras"]
+    )
+    if ce:
+        d["EAN_Oficial"] = eirox_v210_normalizar_ean(d[ce])
+    else:
+        d["EAN_Oficial"] = ""
+
+    # PREÇO + proveniência.
+    # V7.1 — Preço Atual Oficial aceita somente a saída canônica:
+    # VENDA_TESTE Principal ou VENDA_FINAL_TESTE (Venda / Itens).
+    d["Preco_Atual_Oficial"] = pd.to_numeric(
+        d.get("Preco_Ultima_Venda", pd.Series(np.nan, index=d.index)),
+        errors="coerce",
+    )
+    d.loc[
+        ~d["Preco_Atual_Oficial"].notna() | ~d["Preco_Atual_Oficial"].gt(0),
+        "Preco_Atual_Oficial"
+    ] = np.nan
+    d["Regra_Preco_Oficial_Versao"] = "V7.1-STRICT-20260909"
+    d["Fonte_Preco_Oficial"] = eirox_v210_serie_texto(
+        d,
+        ["Fonte_Preço_Eirox", "Fonte_Preco_Principal", "Fonte_Preco"],
+        "SEM PREÇO",
+    )
+    d["Data_Preco_Oficial"] = eirox_v210_serie_texto(
+        d,
+        ["Data_Ultima_Venda", "Data Última Venda", "Data_Preco"],
+        "",
+    )
+    # Quando o preço vem do fechamento mensal, a competência é a referência.
+    _mes_preco = eirox_v210_serie_texto(
+        d,
+        ["Mes_Fechado_Referencia", "Mês Fechado Referência"],
+        "",
+    )
+    _sem_data_preco = d["Data_Preco_Oficial"].astype(str).str.strip().isin(
+        ["", "NaT", "nan", "None"]
+    )
+    d.loc[_sem_data_preco, "Data_Preco_Oficial"] = _mes_preco.loc[_sem_data_preco]
+
+    # CUSTO + proveniência. O valor de Custo já passou pela regra oficial V1.4.68.
+    d["Custo_Oficial"] = eirox_v210_serie_numerica(
+        d,
+        ["Custo", "Custo_Unitario_Eirox", "Custo Unitário", "Custo_Unitario"],
+    )
+    d["Fonte_Custo_Oficial_2_0"] = eirox_v210_serie_texto(
+        d,
+        ["Fonte_Custo"],
+        "SEM CUSTO",
+    )
+    d["Motivo_Custo_Oficial"] = eirox_v210_serie_texto(
+        d,
+        ["Motivo_Sem_Custo"],
+        "",
+    )
+    d["Mes_Custo_Oficial"] = eirox_v210_serie_texto(
+        d,
+        ["Mes_Custo_Venda"],
+        "",
+    )
+
+    # MERCADO + ocorrência vencedora.
+    d["Preco_Mercado_Oficial"] = eirox_v210_serie_numerica(
+        d,
+        ["Menor Preço Concorrente", "Menor_Preco_Concorrente", "Menor Preço"],
+    )
+    d["Loja_Mercado_Oficial"] = eirox_v210_serie_texto(
+        d,
+        ["Loja do Menor Preço", "Loja_Menor_Preco", "Rede Menor Preço"],
+        "",
+    )
+    d["Data_Mercado_Oficial"] = eirox_v210_serie_texto(
+        d,
+        ["Data da Pesquisa", "Data Pesquisa", "Data_Pesquisa"],
+        "",
+    )
+    d["Fonte_Mercado_Oficial"] = np.where(
+        pd.to_numeric(d["Preco_Mercado_Oficial"], errors="coerce").gt(0),
+        "VENDA_TESTE — CONCORRENTE",
+        "SEM PREÇO CONCORRENTE",
+    )
+
+    # 3) VOLUME OFICIAL — último mês fechado com venda por EAN.
+    try:
+        mapa_volume = eirox_v158_ultimo_mes_fechado_memoria(
+            venda_base if isinstance(venda_base, pd.DataFrame) else pd.DataFrame()
+        )
+    except Exception:
+        mapa_volume = pd.DataFrame()
+
+    if (
+        isinstance(mapa_volume, pd.DataFrame)
+        and not mapa_volume.empty
+        and "EAN" in mapa_volume.columns
+    ):
+        mv = mapa_volume.copy()
+        mv["_EAN_V210"] = eirox_v210_normalizar_ean(mv["EAN"])
+        mv = mv.drop_duplicates("_EAN_V210", keep="last")
+        mapa_qtd = mv.set_index("_EAN_V210")["Itens_Mes_Fechado"]
+        mapa_venda = mv.set_index("_EAN_V210")["Venda_Mes_Fechado"]
+        mapa_mes = mv.set_index("_EAN_V210")["Mes_Fechado_Referencia"]
+
+        d["Volume_Oficial"] = d["EAN_Oficial"].map(mapa_qtd)
+        d["Faturamento_Mes_Oficial"] = d["EAN_Oficial"].map(mapa_venda)
+        d["Mes_Volume_Oficial"] = d["EAN_Oficial"].map(mapa_mes).fillna("")
+    else:
+        d["Volume_Oficial"] = np.nan
+        d["Faturamento_Mes_Oficial"] = np.nan
+        d["Mes_Volume_Oficial"] = ""
+
+    d["Fonte_Volume_Oficial"] = np.where(
+        pd.to_numeric(d["Volume_Oficial"], errors="coerce").gt(0),
+        "VENDA_FINAL_TESTE — ÚLTIMO MÊS FECHADO",
+        "SEM VOLUME FECHADO",
+    )
+
+    # 4) RECOMENDAÇÃO E GANHO — sem criar threshold novo.
+    d["Recomendacao_Oficial"] = eirox_v210_serie_texto(
+        d,
+        [
+            "Recomendacao_Central",
+            "Recomendação Central",
+            "Recomendacao",
+            "Recomendação",
+        ],
+        "",
+    )
+    d["Ganho_Potencial_Oficial"] = eirox_v210_serie_numerica(
+        d,
+        [
+            "Ganho_Potencial_Final",
+            "Ganho_Potencial_Atualizado",
+            "Ganho_Potencial_Simulador",
+            "Ganho_Potencial",
+        ],
+    ).fillna(0)
+
+    # 5) Qualidade/rastreabilidade — nenhum produto desaparece.
+    preco_ok = pd.to_numeric(d["Preco_Atual_Oficial"], errors="coerce").gt(0)
+    custo_ok = pd.to_numeric(d["Custo_Oficial"], errors="coerce").gt(0)
+    mercado_ok = pd.to_numeric(d["Preco_Mercado_Oficial"], errors="coerce").gt(0)
+    volume_ok = pd.to_numeric(d["Volume_Oficial"], errors="coerce").gt(0)
+
+    pendencias = pd.Series("", index=d.index, dtype="object")
+    pendencias = pendencias + np.where(preco_ok, "", "PREÇO; ")
+    pendencias = pendencias + np.where(custo_ok, "", "CUSTO; ")
+    pendencias = pendencias + np.where(mercado_ok, "", "MERCADO; ")
+    pendencias = pendencias + np.where(volume_ok, "", "VOLUME; ")
+    pendencias = pendencias.str.replace(r"; $", "", regex=True)
+
+    d["Status_Dado_Oficial"] = np.where(
+        preco_ok & custo_ok & mercado_ok & volume_ok,
+        "COMPLETO",
+        "PENDENTE",
+    )
+    d["Pendencias_Dado_Oficial"] = pendencias
+
+    d["Cobertura_Dado_Oficial_%"] = (
+        (
+            preco_ok.astype(int)
+            + custo_ok.astype(int)
+            + mercado_ok.astype(int)
+            + volume_ok.astype(int)
+        ) / 4 * 100
+    ).round(0)
+
+    # Métricas derivadas somente quando preço/custo oficiais existem.
+    d["Lucro_Unitario_Oficial"] = np.where(
+        preco_ok & custo_ok,
+        d["Preco_Atual_Oficial"] - d["Custo_Oficial"],
+        np.nan,
+    )
+    d["Margem_Oficial_%"] = np.where(
+        preco_ok & custo_ok,
+        (d["Lucro_Unitario_Oficial"] / d["Preco_Atual_Oficial"]) * 100,
+        np.nan,
+    )
+
+    return d
+
+
+@st.cache_resource(show_spinner=False, max_entries=8)
+def eirox_v210_camada_oficial_cacheada(
+    assinatura_master,
+    assinatura_historico,
+    assinatura_venda,
+    assinatura_contexto,
+    _base,
+    _historico,
+    _venda,
+):
+    return eirox_v210_aplicar_camada_oficial(
+        _base,
+        historico_base=_historico,
+        venda_base=_venda,
+    )
+
+
+
+# ==========================================================
+# EIROX PRICING 2.0 — FASE 4
+# CENTRAL DE QUALIDADE DE DADOS
+# ==========================================================
+def eirox_v240_coluna_existente(base, candidatos):
+    if not isinstance(base, pd.DataFrame):
+        return None
+    mapa = {
+        re.sub(r"[^a-z0-9]", "", str(c).lower()): c
+        for c in base.columns
+    }
+    for cand in candidatos:
+        k = re.sub(r"[^a-z0-9]", "", str(cand).lower())
+        if k in mapa:
+            return mapa[k]
+    return None
+
+
+def eirox_v240_preparar_qualidade(base):
+    """
+    Fila operacional de qualidade.
+    Prioridade objetiva: maior faturamento do último mês fechado associado
+    ao EAN pendente; em empate, maior quantidade de pilares ausentes.
+    """
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return pd.DataFrame()
+
+    d = base.copy()
+
+    c_ean = eirox_v240_coluna_existente(
+        d, ["EAN_Oficial", "EAN", "EAN (GTIN)", "GTIN", "Código de Barras"]
+    )
+    c_prod = eirox_v240_coluna_existente(
+        d, ["Produto", "Descrição", "Descricao", "Nome Produto"]
+    )
+    c_fab = eirox_v240_coluna_existente(
+        d, ["Fabricante", "Laboratório", "Laboratorio", "Marca"]
+    )
+    c_curva = eirox_v240_coluna_existente(
+        d, ["CURVA", "Curva", "Curva ABC", "Classificação ABC", "Classificacao ABC"]
+    )
+    c_familia = eirox_v240_coluna_existente(
+        d, ["Família", "Familia", "Classificação", "Classificacao"]
+    )
+
+    out = pd.DataFrame(index=d.index)
+    out["EAN"] = (
+        eirox_v210_normalizar_ean(d[c_ean])
+        if c_ean else d.index.astype(str)
+    )
+    out["Produto"] = d[c_prod].fillna("").astype(str).str.strip() if c_prod else ""
+    out["Fabricante"] = d[c_fab].fillna("").astype(str).str.strip() if c_fab else ""
+    out["Curva"] = d[c_curva].fillna("").astype(str).str.strip() if c_curva else ""
+    out["Família"] = d[c_familia].fillna("").astype(str).str.strip() if c_familia else ""
+
+    out["Preço Atual"] = pd.to_numeric(
+        d.get("Preco_Atual_Oficial", np.nan), errors="coerce"
+    )
+    out["Fonte Preço"] = d.get(
+        "Fonte_Preco_Oficial", pd.Series("", index=d.index)
+    ).fillna("").astype(str)
+
+    out["Custo"] = pd.to_numeric(
+        d.get("Custo_Oficial", np.nan), errors="coerce"
+    )
+    out["Fonte Custo"] = d.get(
+        "Fonte_Custo_Oficial_2_0", pd.Series("", index=d.index)
+    ).fillna("").astype(str)
+    out["Motivo Custo"] = d.get(
+        "Motivo_Custo_Oficial", pd.Series("", index=d.index)
+    ).fillna("").astype(str)
+
+    out["Menor Preço Concorrente"] = pd.to_numeric(
+        d.get("Preco_Mercado_Oficial", np.nan), errors="coerce"
+    )
+    out["Loja Menor Preço"] = d.get(
+        "Loja_Mercado_Oficial", pd.Series("", index=d.index)
+    ).fillna("").astype(str)
+    out["Data Pesquisa"] = d.get(
+        "Data_Mercado_Oficial", pd.Series("", index=d.index)
+    ).fillna("").astype(str)
+
+    out["Volume Último Mês"] = pd.to_numeric(
+        d.get("Volume_Oficial", np.nan), errors="coerce"
+    )
+    out["Competência Volume"] = d.get(
+        "Mes_Volume_Oficial", pd.Series("", index=d.index)
+    ).fillna("").astype(str)
+
+    out["Faturamento Último Mês"] = pd.to_numeric(
+        d.get("Faturamento_Mes_Oficial", np.nan), errors="coerce"
+    ).fillna(0)
+
+    out["Cobertura %"] = pd.to_numeric(
+        d.get("Cobertura_Dado_Oficial_%", np.nan), errors="coerce"
+    )
+
+    ok_preco = out["Preço Atual"].notna() & out["Preço Atual"].gt(0)
+    ok_custo = out["Custo"].notna() & out["Custo"].gt(0)
+    ok_mercado = (
+        out["Menor Preço Concorrente"].notna()
+        & out["Menor Preço Concorrente"].gt(0)
+    )
+    ok_volume = out["Volume Último Mês"].notna() & out["Volume Último Mês"].gt(0)
+
+    faltas = pd.DataFrame({
+        "PREÇO": ~ok_preco,
+        "CUSTO": ~ok_custo,
+        "MERCADO": ~ok_mercado,
+        "VOLUME": ~ok_volume,
+    }, index=out.index)
+
+    out["Qtd Pendências"] = faltas.sum(axis=1).astype(int)
+    out["Pendências"] = faltas.apply(
+        lambda r: "; ".join([c for c, v in r.items() if bool(v)]),
+        axis=1,
+    )
+    out["Status"] = np.where(out["Qtd Pendências"].eq(0), "COMPLETO", "PENDENTE")
+
+    out["Faturamento Associado à Pendência"] = np.where(
+        out["Qtd Pendências"].gt(0),
+        out["Faturamento Último Mês"],
+        0.0,
+    )
+
+    out = (
+        out.sort_index(kind="stable")
+        .drop_duplicates("EAN", keep="first")
+        .reset_index(drop=True)
+    )
+
+    return out.sort_values(
+        ["Faturamento Associado à Pendência", "Qtd Pendências", "Produto"],
+        ascending=[False, False, True],
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+@st.cache_resource(show_spinner=False, max_entries=8)
+def eirox_v240_preparar_qualidade_cacheada(
+    assinatura_master,
+    assinatura_contexto,
+    _base,
+):
+    return eirox_v240_preparar_qualidade(_base)
+
+
+def eirox_v240_render_central_qualidade(base):
+    st.markdown("## 🧪 Central de Qualidade de Dados")
+    st.caption(
+        "Fila operacional das pendências de preço, custo, mercado e volume. "
+        "A ordenação usa o faturamento do último mês fechado associado a cada EAN."
+    )
+
+    q = eirox_v240_preparar_qualidade_cacheada(
+        globals().get("_eirox_sig_master", ""),
+        globals().get("_eirox_sig_contexto", ""),
+        base,
+    ).copy(deep=False)
+
+    if not isinstance(q, pd.DataFrame) or q.empty:
+        st.info("Não há base oficial disponível para auditar.")
+        return
+
+    pend = q[q["Status"].eq("PENDENTE")].copy()
+    total = int(len(q))
+    completos = int(q["Status"].eq("COMPLETO").sum())
+    pendentes = int(len(pend))
+    cobertura = (completos / total * 100.0) if total else 0.0
+    fat_pend = (
+        float(pd.to_numeric(
+            pend["Faturamento Associado à Pendência"], errors="coerce"
+        ).fillna(0).sum())
+        if pendentes else 0.0
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Produtos auditados", f"{total:,}".replace(",", "."))
+    c2.metric("Completos", f"{completos:,}".replace(",", "."))
+    c3.metric("Com pendência", f"{pendentes:,}".replace(",", "."))
+    c4.metric("Cobertura completa", f"{cobertura:.1f}%".replace(".", ","))
+
+    st.metric(
+        "Faturamento do último mês associado a produtos com pendência",
+        moeda_br(fat_pend),
+    )
+    st.caption(
+        "Esse valor não representa perda nem ganho potencial. "
+        "É o faturamento real do último mês fechado vinculado aos EANs incompletos."
+    )
+
+    if pendentes == 0:
+        st.success("✅ Todos os produtos auditados possuem os quatro pilares oficiais.")
+        return
+
+    resumo = pd.DataFrame([
+        {
+            "Pendência": nome,
+            "Produtos": int(pend["Pendências"].str.contains(nome, regex=False).sum()),
+            "Faturamento associado": float(
+                pd.to_numeric(
+                    pend.loc[
+                        pend["Pendências"].str.contains(nome, regex=False),
+                        "Faturamento Associado à Pendência"
+                    ],
+                    errors="coerce"
+                ).fillna(0).sum()
+            ),
+        }
+        for nome in ["PREÇO", "CUSTO", "MERCADO", "VOLUME"]
+    ])
+    resumo = resumo[resumo["Produtos"].gt(0)].sort_values(
+        ["Faturamento associado", "Produtos"],
+        ascending=[False, False],
+        kind="stable",
+    )
+
+    st.markdown("### Onde estão as maiores pendências")
+    eirox_dataframe_brl(resumo, use_container_width=True, hide_index=True)
+
+    st.markdown("### Fila de correção")
+    f1, f2, f3, f4 = st.columns(4)
+
+    tipos_disponiveis = [
+        x for x in ["PREÇO", "CUSTO", "MERCADO", "VOLUME"]
+        if pend["Pendências"].str.contains(x, regex=False).any()
+    ]
+    tipo_sel = f1.multiselect(
+        "Tipo de pendência", tipos_disponiveis, default=[],
+        key="eirox_v240_f_tipo"
+    )
+
+    fabricantes = sorted(
+        [x for x in pend["Fabricante"].dropna().astype(str).unique() if x.strip()]
+    )
+    fab_sel = f2.multiselect(
+        "Fabricante", fabricantes, default=[],
+        key="eirox_v240_f_fab"
+    )
+
+    curvas = sorted(
+        [x for x in pend["Curva"].dropna().astype(str).unique() if x.strip()]
+    )
+    curva_sel = f3.multiselect(
+        "Curva", curvas, default=[],
+        key="eirox_v240_f_curva"
+    )
+
+    busca = f4.text_input(
+        "EAN ou produto", value="",
+        key="eirox_v240_f_busca",
+        placeholder="Digite para localizar",
+    ).strip()
+
+    filtrado = pend.copy()
+
+    if tipo_sel:
+        mask = pd.Series(False, index=filtrado.index)
+        for t in tipo_sel:
+            mask = mask | filtrado["Pendências"].str.contains(t, regex=False)
+        filtrado = filtrado[mask].copy()
+
+    if fab_sel:
+        filtrado = filtrado[filtrado["Fabricante"].isin(fab_sel)].copy()
+
+    if curva_sel:
+        filtrado = filtrado[filtrado["Curva"].isin(curva_sel)].copy()
+
+    if busca:
+        b = busca.casefold()
+        filtrado = filtrado[
+            filtrado["EAN"].astype(str).str.casefold().str.contains(b, regex=False)
+            | filtrado["Produto"].astype(str).str.casefold().str.contains(b, regex=False)
+        ].copy()
+
+    filtrado = filtrado.sort_values(
+        ["Faturamento Associado à Pendência", "Qtd Pendências", "Produto"],
+        ascending=[False, False, True],
+        kind="stable",
+    )
+
+    fc1, fc2 = st.columns(2)
+    fc1.metric(
+        "Produtos na fila filtrada",
+        f"{len(filtrado):,}".replace(",", "."),
+    )
+    fc2.metric(
+        "Faturamento associado à fila",
+        moeda_br(float(pd.to_numeric(
+            filtrado["Faturamento Associado à Pendência"], errors="coerce"
+        ).fillna(0).sum()) if not filtrado.empty else 0.0),
+    )
+
+    cols = [
+        "EAN", "Produto", "Fabricante", "Curva", "Família",
+        "Pendências", "Qtd Pendências",
+        "Preço Atual", "Fonte Preço",
+        "Custo", "Fonte Custo", "Motivo Custo",
+        "Menor Preço Concorrente", "Loja Menor Preço", "Data Pesquisa",
+        "Volume Último Mês", "Competência Volume",
+        "Faturamento Último Mês",
+        "Faturamento Associado à Pendência",
+        "Cobertura %",
+    ]
+    cols = [c for c in cols if c in filtrado.columns]
+
+    if filtrado.empty:
+        st.info("Nenhum produto atende aos filtros selecionados.")
+    else:
+        eirox_dataframe_brl(
+            filtrado[cols],
+            use_container_width=True,
+            hide_index=True,
+            height=560,
+        )
+
+        if globals().get("pode_exportar", True):
+            eirox_botao_excel_padrao(
+                filtrado[cols],
+                titulo="Central de Qualidade de Dados — Eirox Pricing",
+                arquivo="Eirox_Central_Qualidade_Dados.xlsx",
+                key="eirox_v240_exportar_qualidade",
+                use_container_width=True,
+            )
+
+    if pend["Fabricante"].astype(str).str.strip().ne("").any():
+        rank = (
+            pend.assign(
+                Fabricante=pend["Fabricante"].fillna("").astype(str).str.strip()
+            )
+            .loc[lambda x: x["Fabricante"].ne("")]
+            .groupby("Fabricante", as_index=False)
+            .agg(
+                Produtos_com_pendência=("EAN", "nunique"),
+                Faturamento_associado=("Faturamento Associado à Pendência", "sum"),
+            )
+            .sort_values(
+                ["Faturamento_associado", "Produtos_com_pendência"],
+                ascending=[False, False],
+                kind="stable",
+            )
+        )
+        if not rank.empty:
+            st.markdown("### Pendências por fabricante")
+            eirox_dataframe_brl(rank, use_container_width=True, hide_index=True)
+
+
+
+# ==========================================================
+# EIROX PRICING 2.0 — FASE 5
+# PLANO DE AÇÕES + RESPONSÁVEL + STATUS + PRAZO
+# ==========================================================
+def eirox_v250_workflow_dir():
+    pasta = Path(__file__).resolve().parent / "_cache_pricing" / "workflow_v250"
+    pasta.mkdir(parents=True, exist_ok=True)
+    return pasta
+
+
+def eirox_v250_contexto_chave():
+    partes = [
+        str(globals().get("_eirox_sig_contexto", "")),
+        str(globals().get("nome_empresa_contexto", "")),
+        str(globals().get("cliente_id_contexto", "")),
+        str(globals().get("empresa_id_contexto", "")),
+    ]
+    raw = "|".join(partes).strip("|") or "contexto_padrao"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def eirox_v250_arquivo_acoes():
+    return eirox_v250_workflow_dir() / f"acoes_{eirox_v250_contexto_chave()}.csv"
+
+
+def eirox_v250_colunas_acoes():
+    return [
+        "ID_Acao", "EAN", "Produto", "Tipo_Acao", "Origem",
+        "Preco_Atual", "Preco_Referencia", "Potencial_Identificado",
+        "Responsavel", "Status", "Prazo", "Observacao",
+        "Criado_Em", "Criado_Por", "Atualizado_Em", "Atualizado_Por",
+    ]
+
+
+def eirox_v250_ler_acoes():
+    arq = eirox_v250_arquivo_acoes()
+    cols = eirox_v250_colunas_acoes()
+    if not arq.exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        d = pd.read_csv(arq, dtype=str, keep_default_na=False)
+        for c in cols:
+            if c not in d.columns:
+                d[c] = ""
+        return d[cols].copy()
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+
+def eirox_v250_salvar_acoes(base):
+    if not isinstance(base, pd.DataFrame):
+        return False
+    cols = eirox_v250_colunas_acoes()
+    d = base.copy()
+    for c in cols:
+        if c not in d.columns:
+            d[c] = ""
+    d = d[cols].copy()
+
+    arq = eirox_v250_arquivo_acoes()
+    tmp = arq.with_name(f".tmp_{arq.name}")
+    try:
+        d.to_csv(tmp, index=False, encoding="utf-8-sig")
+        os.replace(tmp, arq)
+        return True
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def eirox_v250_id_acao(ean, tipo):
+    contexto = eirox_v250_contexto_chave()
+    raw = f"{contexto}|{str(ean).strip()}|{str(tipo).strip().upper()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def eirox_v250_usuario_atual():
+    try:
+        return usuario_logado_eirox()
+    except Exception:
+        return str(
+            st.session_state.get("usuario")
+            or st.session_state.get("username")
+            or "usuario"
+        )
+
+
+def eirox_v250_num(v):
+    try:
+        x = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
+        return float(x) if pd.notna(x) else 0.0
+    except Exception:
+        return 0.0
+
+
+def eirox_v250_oportunidades(base):
+    """
+    Consolida oportunidades sem alterar as regras oficiais:
+    - AJUSTAR PREÇO: lista financeira unificada de SUBIR PREÇO;
+    - NEGOCIAR CUSTO / REVISAR MERCADO: Motor de Rentabilidade já existente.
+    """
+    cols = [
+        "EAN", "Produto", "Tipo_Acao", "Origem",
+        "Preco_Atual", "Preco_Referencia", "Potencial_Identificado",
+    ]
+    blocos = []
+
+    # 1) Preço — mesma população financeira do simulador unificado.
+    try:
+        sim = eirox_v159_simulacao_unificada(base.copy())
+        if isinstance(sim, pd.DataFrame) and not sim.empty:
+            p = pd.DataFrame(index=sim.index)
+            p["EAN"] = eirox_v210_normalizar_ean(sim.get("EAN", pd.Series("", index=sim.index)))
+            p["Produto"] = sim.get(
+                "Produto_Simulador", pd.Series("", index=sim.index)
+            ).fillna("").astype(str)
+            p["Tipo_Acao"] = "AJUSTAR PREÇO"
+            p["Origem"] = "SIMULADOR UNIFICADO — SUBIR PREÇO"
+            p["Preco_Atual"] = pd.to_numeric(sim.get("Preco_Atual", np.nan), errors="coerce")
+            p["Preco_Referencia"] = pd.to_numeric(
+                sim.get("Preco_Sugerido_Mercado", np.nan), errors="coerce"
+            )
+            p["Potencial_Identificado"] = pd.to_numeric(
+                sim.get("Ganho_Potencial_Simulador", 0), errors="coerce"
+            ).fillna(0)
+            blocos.append(p)
+    except Exception:
+        pass
+
+    # 2) Custo / mercado — usa o Motor de Rentabilidade vigente, sem redefinir regra.
+    try:
+        rent = eirox_v160_motor_rentabilidade(base.copy())
+        if isinstance(rent, pd.DataFrame) and not rent.empty:
+            r = rent[
+                rent["Ação Rentabilidade"].isin(["NEGOCIAR CUSTO", "REVISAR MERCADO"])
+            ].copy()
+            if not r.empty:
+                p = pd.DataFrame(index=r.index)
+                p["EAN"] = eirox_v210_normalizar_ean(r["EAN"])
+                p["Produto"] = r.get("Produto", pd.Series("", index=r.index)).fillna("").astype(str)
+                p["Tipo_Acao"] = r["Ação Rentabilidade"].astype(str)
+                p["Origem"] = "MOTOR DE RENTABILIDADE"
+                p["Preco_Atual"] = pd.to_numeric(r.get("Preço Atual", np.nan), errors="coerce")
+                p["Preco_Referencia"] = pd.to_numeric(
+                    r.get("Preço Mercado", np.nan), errors="coerce"
+                )
+                pot_preco = pd.to_numeric(
+                    r.get("Potencial por Preço", 0), errors="coerce"
+                ).fillna(0)
+                pot_custo = pd.to_numeric(
+                    r.get("Potencial por Custo", 0), errors="coerce"
+                ).fillna(0)
+                p["Potencial_Identificado"] = np.where(
+                    p["Tipo_Acao"].eq("NEGOCIAR CUSTO"),
+                    pot_custo,
+                    pot_preco,
+                )
+                blocos.append(p)
+    except Exception:
+        pass
+
+    if not blocos:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.concat(blocos, ignore_index=True)
+    out["EAN"] = out["EAN"].fillna("").astype(str)
+    out = out[out["EAN"].ne("")].copy()
+    out["Potencial_Identificado"] = pd.to_numeric(
+        out["Potencial_Identificado"], errors="coerce"
+    ).fillna(0)
+    out = (
+        out.sort_values(
+            ["Potencial_Identificado", "Tipo_Acao", "Produto"],
+            ascending=[False, True, True],
+            kind="stable",
+        )
+        .drop_duplicates(["EAN", "Tipo_Acao"], keep="first")
+        .reset_index(drop=True)
+    )
+    return out[cols]
+
+
+@st.cache_resource(show_spinner=False, max_entries=8)
+def eirox_v250_oportunidades_cacheadas(
+    assinatura_master,
+    assinatura_contexto,
+    _base,
+):
+    return eirox_v250_oportunidades(_base)
+
+
+def eirox_v250_adicionar_oportunidades(oportunidades):
+    if not isinstance(oportunidades, pd.DataFrame) or oportunidades.empty:
+        return 0
+
+    atual = eirox_v250_ler_acoes()
+    existentes = set(atual["ID_Acao"].astype(str)) if not atual.empty else set()
+    usuario = eirox_v250_usuario_atual()
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    novos = []
+
+    for _, row in oportunidades.iterrows():
+        ean = str(row.get("EAN", "")).strip()
+        tipo = str(row.get("Tipo_Acao", "")).strip()
+        if not ean or not tipo:
+            continue
+        aid = eirox_v250_id_acao(ean, tipo)
+        if aid in existentes:
+            continue
+        novos.append({
+            "ID_Acao": aid,
+            "EAN": ean,
+            "Produto": str(row.get("Produto", "")).strip(),
+            "Tipo_Acao": tipo,
+            "Origem": str(row.get("Origem", "")).strip(),
+            "Preco_Atual": row.get("Preco_Atual", ""),
+            "Preco_Referencia": row.get("Preco_Referencia", ""),
+            "Potencial_Identificado": row.get("Potencial_Identificado", 0),
+            "Responsavel": "",
+            "Status": "PENDENTE",
+            "Prazo": "",
+            "Observacao": "",
+            "Criado_Em": agora,
+            "Criado_Por": usuario,
+            "Atualizado_Em": agora,
+            "Atualizado_Por": usuario,
+        })
+        existentes.add(aid)
+
+    if not novos:
+        return 0
+
+    novo_df = pd.DataFrame(novos)
+    base_final = pd.concat([atual, novo_df], ignore_index=True)
+    return len(novos) if eirox_v250_salvar_acoes(base_final) else 0
+
+
+def eirox_v250_atualizar_acao(id_acao, responsavel, status, prazo, observacao):
+    acoes = eirox_v250_ler_acoes()
+    if acoes.empty or not id_acao:
+        return False
+    mask = acoes["ID_Acao"].astype(str).eq(str(id_acao))
+    if not mask.any():
+        return False
+    usuario = eirox_v250_usuario_atual()
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    acoes.loc[mask, "Responsavel"] = str(responsavel or "").strip()
+    acoes.loc[mask, "Status"] = str(status or "PENDENTE").strip()
+    acoes.loc[mask, "Prazo"] = str(prazo or "").strip()
+    acoes.loc[mask, "Observacao"] = str(observacao or "").strip()
+    acoes.loc[mask, "Atualizado_Em"] = agora
+    acoes.loc[mask, "Atualizado_Por"] = usuario
+    return eirox_v250_salvar_acoes(acoes)
+
+
+def eirox_v250_render_plano_acoes(base):
+    st.markdown("## 📋 Plano de Ações")
+    st.caption(
+        "Transforma oportunidades do Pricing em execução operacional com "
+        "responsável, status, prazo e histórico de atualização."
+    )
+
+    oportunidades = eirox_v250_oportunidades_cacheadas(
+        globals().get("_eirox_sig_master", ""),
+        globals().get("_eirox_sig_contexto", ""),
+        base,
+    ).copy(deep=False)
+
+    acoes = eirox_v250_ler_acoes()
+
+    # Indicadores da carteira.
+    total_oport = int(len(oportunidades)) if isinstance(oportunidades, pd.DataFrame) else 0
+    potencial_total = (
+        float(pd.to_numeric(
+            oportunidades.get("Potencial_Identificado", 0), errors="coerce"
+        ).fillna(0).sum())
+        if total_oport else 0.0
+    )
+    abertas = int(
+        (~acoes["Status"].isin(["CONCLUÍDO", "CANCELADO"])).sum()
+    ) if not acoes.empty else 0
+    concluidas = int(acoes["Status"].eq("CONCLUÍDO").sum()) if not acoes.empty else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Oportunidades atuais", f"{total_oport:,}".replace(",", "."))
+    c2.metric("Potencial identificado", moeda_br(potencial_total))
+    c3.metric("Ações abertas", f"{abertas:,}".replace(",", "."))
+    c4.metric("Concluídas", f"{concluidas:,}".replace(",", "."))
+
+    st.markdown("### 1. Oportunidades identificadas")
+    if not isinstance(oportunidades, pd.DataFrame) or oportunidades.empty:
+        st.info("Nenhuma oportunidade operacional encontrada para a seleção atual.")
+    else:
+        filtros1, filtros2 = st.columns(2)
+        tipos = sorted(oportunidades["Tipo_Acao"].dropna().astype(str).unique().tolist())
+        tipo_sel = filtros1.multiselect(
+            "Tipo de ação",
+            tipos,
+            default=[],
+            key="eirox_v250_tipo_oportunidade",
+        )
+        busca = filtros2.text_input(
+            "EAN ou produto",
+            key="eirox_v250_busca_oportunidade",
+            placeholder="Digite para localizar",
+        ).strip()
+
+        opp_view = oportunidades.copy()
+        if tipo_sel:
+            opp_view = opp_view[opp_view["Tipo_Acao"].isin(tipo_sel)].copy()
+        if busca:
+            b = busca.casefold()
+            opp_view = opp_view[
+                opp_view["EAN"].astype(str).str.casefold().str.contains(b, regex=False)
+                | opp_view["Produto"].astype(str).str.casefold().str.contains(b, regex=False)
+            ].copy()
+
+        tabela_opp = opp_view.rename(columns={
+            "Tipo_Acao": "Ação",
+            "Preco_Atual": "Preço Atual",
+            "Preco_Referencia": "Preço Referência",
+            "Potencial_Identificado": "Potencial Identificado",
+        })
+        eirox_dataframe_brl(
+            tabela_opp,
+            use_container_width=True,
+            hide_index=True,
+            height=390,
+        )
+
+        if st.button(
+            "➕ Adicionar oportunidades filtradas ao plano",
+            key="eirox_v250_adicionar_filtradas",
+            type="primary",
+            use_container_width=True,
+        ):
+            qtd = eirox_v250_adicionar_oportunidades(opp_view)
+            if qtd > 0:
+                st.success(f"{qtd} nova(s) ação(ões) adicionada(s) ao plano.")
+                st.rerun()
+            else:
+                st.info("As oportunidades desta seleção já estão no plano.")
+
+    st.markdown("### 2. Execução e acompanhamento")
+    acoes = eirox_v250_ler_acoes()
+    if acoes.empty:
+        st.info("Ainda não existem ações adicionadas ao plano.")
+        return
+
+    # Converte apenas para exibição/ordenação; arquivo permanece textual e auditável.
+    acoes_view = acoes.copy()
+    acoes_view["Potencial_num"] = pd.to_numeric(
+        acoes_view["Potencial_Identificado"], errors="coerce"
+    ).fillna(0)
+    acoes_view = acoes_view.sort_values(
+        ["Status", "Potencial_num", "Prazo"],
+        ascending=[True, False, True],
+        kind="stable",
+    )
+
+    f1, f2, f3 = st.columns(3)
+    status_opts = ["PENDENTE", "EM ANDAMENTO", "AGUARDANDO", "CONCLUÍDO", "CANCELADO"]
+    status_f = f1.multiselect(
+        "Status",
+        status_opts,
+        default=[],
+        key="eirox_v250_f_status",
+    )
+    responsaveis = sorted(
+        [x for x in acoes_view["Responsavel"].dropna().astype(str).unique() if x.strip()]
+    )
+    resp_f = f2.multiselect(
+        "Responsável",
+        responsaveis,
+        default=[],
+        key="eirox_v250_f_resp",
+    )
+    tipo_f = f3.multiselect(
+        "Ação",
+        sorted(acoes_view["Tipo_Acao"].dropna().astype(str).unique()),
+        default=[],
+        key="eirox_v250_f_tipo",
+    )
+
+    fila = acoes_view.copy()
+    if status_f:
+        fila = fila[fila["Status"].isin(status_f)].copy()
+    if resp_f:
+        fila = fila[fila["Responsavel"].isin(resp_f)].copy()
+    if tipo_f:
+        fila = fila[fila["Tipo_Acao"].isin(tipo_f)].copy()
+
+    hoje = pd.Timestamp.now().normalize()
+    prazos_dt = pd.to_datetime(fila["Prazo"], errors="coerce", dayfirst=True)
+    vencidas = (
+        prazos_dt.notna()
+        & prazos_dt.lt(hoje)
+        & ~fila["Status"].isin(["CONCLUÍDO", "CANCELADO"])
+    )
+    fila["Situação Prazo"] = np.where(vencidas, "ATRASADA", "NO PRAZO / SEM PRAZO")
+
+    mostrar = fila[[
+        "ID_Acao", "EAN", "Produto", "Tipo_Acao", "Origem",
+        "Preco_Atual", "Preco_Referencia", "Potencial_Identificado",
+        "Responsavel", "Status", "Prazo", "Situação Prazo",
+        "Observacao", "Atualizado_Em", "Atualizado_Por",
+    ]].rename(columns={
+        "Tipo_Acao": "Ação",
+        "Preco_Atual": "Preço Atual",
+        "Preco_Referencia": "Preço Referência",
+        "Potencial_Identificado": "Potencial Identificado",
+        "Responsavel": "Responsável",
+        "Observacao": "Observação",
+        "Atualizado_Em": "Atualizado em",
+        "Atualizado_Por": "Atualizado por",
+    })
+
+    eirox_dataframe_brl(
+        mostrar,
+        use_container_width=True,
+        hide_index=True,
+        height=480,
+    )
+
+    # Editor individual para manter persistência e auditoria determinística.
+    labels = (
+        fila["EAN"].astype(str)
+        + " | "
+        + fila["Produto"].astype(str)
+        + " | "
+        + fila["Tipo_Acao"].astype(str)
+    )
+    mapa_label_id = dict(zip(labels, fila["ID_Acao"]))
+    escolhido = st.selectbox(
+        "Selecionar ação para atualizar",
+        list(mapa_label_id.keys()),
+        key="eirox_v250_sel_acao",
+    )
+    id_sel = mapa_label_id.get(escolhido, "")
+    row = fila[fila["ID_Acao"].eq(id_sel)].iloc[0] if id_sel else None
+
+    if row is not None:
+        e1, e2, e3 = st.columns(3)
+        responsavel = e1.text_input(
+            "Responsável",
+            value=str(row.get("Responsavel", "")),
+            key=f"eirox_v250_resp_{id_sel}",
+        )
+        status_atual = str(row.get("Status", "PENDENTE") or "PENDENTE")
+        idx_status = status_opts.index(status_atual) if status_atual in status_opts else 0
+        status = e2.selectbox(
+            "Status",
+            status_opts,
+            index=idx_status,
+            key=f"eirox_v250_status_{id_sel}",
+        )
+
+        prazo_atual = pd.to_datetime(
+            str(row.get("Prazo", "")), errors="coerce", dayfirst=True
+        )
+        prazo_default = (
+            prazo_atual.date()
+            if pd.notna(prazo_atual)
+            else pd.Timestamp.now().date()
+        )
+        prazo_data = e3.date_input(
+            "Prazo",
+            value=prazo_default,
+            key=f"eirox_v250_prazo_{id_sel}",
+        )
+        observacao = st.text_area(
+            "Observação",
+            value=str(row.get("Observacao", "")),
+            key=f"eirox_v250_obs_{id_sel}",
+            height=100,
+        )
+
+        if st.button(
+            "💾 Salvar atualização da ação",
+            key=f"eirox_v250_salvar_{id_sel}",
+            type="primary",
+            use_container_width=True,
+        ):
+            ok = eirox_v250_atualizar_acao(
+                id_sel,
+                responsavel,
+                status,
+                prazo_data.strftime("%d/%m/%Y") if prazo_data else "",
+                observacao,
+            )
+            if ok:
+                st.success("Ação atualizada.")
+                st.rerun()
+            else:
+                st.error("Não foi possível salvar a atualização.")
+
+    st.markdown("### 3. Resumo operacional")
+    base_resumo = eirox_v250_ler_acoes()
+    if not base_resumo.empty:
+        resumo_status = (
+            base_resumo.groupby("Status", as_index=False)
+            .agg(
+                Ações=("ID_Acao", "count"),
+                Potencial_Identificado=("Potencial_Identificado", lambda s: pd.to_numeric(s, errors="coerce").fillna(0).sum()),
+            )
+            .sort_values("Potencial_Identificado", ascending=False, kind="stable")
+        )
+        eirox_dataframe_brl(
+            resumo_status,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if globals().get("pode_exportar", True):
+            exportar = base_resumo.rename(columns={
+                "Tipo_Acao": "Ação",
+                "Preco_Atual": "Preço Atual",
+                "Preco_Referencia": "Preço Referência",
+                "Potencial_Identificado": "Potencial Identificado",
+                "Responsavel": "Responsável",
+                "Observacao": "Observação",
+                "Criado_Em": "Criado em",
+                "Criado_Por": "Criado por",
+                "Atualizado_Em": "Atualizado em",
+                "Atualizado_Por": "Atualizado por",
+            })
+            eirox_botao_excel_padrao(
+                exportar,
+                titulo="Plano de Ações — Eirox Pricing",
+                arquivo="Eirox_Plano_de_Acoes.xlsx",
+                key="eirox_v250_exportar_acoes",
+                use_container_width=True,
+            )
+
+    st.caption(
+        "Persistência desta Fase 5 usa arquivo local do aplicativo, separado por contexto do cliente. "
+        "Em hospedagem com filesystem efêmero, a próxima etapa deverá mover esse histórico para banco persistente."
+    )
+
+
+
+# ==========================================================
+# EIROX PRICING 2.0 — FASE 6
+# EXECUÇÃO REGISTRADA E RESULTADO REALIZADO
+# ==========================================================
+def eirox_v260_db():
+    import sqlite3
+    p = eirox_v250_workflow_dir() / f"realizado_{eirox_v250_contexto_chave()}.sqlite3"
+    con = sqlite3.connect(str(p), timeout=30)
+    con.execute("PRAGMA busy_timeout=30000")
+    con.execute("""CREATE TABLE IF NOT EXISTS execucoes (
+        id TEXT PRIMARY KEY, acao_id TEXT NOT NULL, ean TEXT NOT NULL,
+        tipo TEXT NOT NULL, executado_em TEXT NOT NULL,
+        preco_anterior REAL, preco_executado REAL,
+        custo_anterior REAL, custo_executado REAL,
+        potencial_identificado REAL, volume_referencia REAL,
+        competencia_referencia TEXT, usuario TEXT, observacao TEXT,
+        criado_em TEXT NOT NULL)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS apuracoes (
+        id TEXT PRIMARY KEY, execucao_id TEXT NOT NULL,
+        competencia TEXT NOT NULL, quantidade REAL, venda REAL,
+        custo_total REAL, preco_medio REAL, custo_unitario REAL,
+        resultado_realizado REAL, status TEXT, motivo TEXT,
+        apurado_em TEXT NOT NULL, UNIQUE(execucao_id, competencia))""")
+    return con
+
+
+def eirox_v260_num(v):
+    try:
+        x = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
+        return float(x) if pd.notna(x) and np.isfinite(x) else None
+    except Exception:
+        return None
+
+
+def eirox_v260_registrar(acao, data, preco, custo, observacao):
+    import uuid
+    from datetime import datetime as _dt
+    if not isinstance(acao, dict) or not acao.get("ID_Acao"):
+        raise ValueError("Selecione uma ação válida.")
+    if str(acao.get("Status", "")) == "CANCELADO":
+        raise ValueError("Uma ação cancelada não pode ser executada.")
+    tipo = str(acao.get("Tipo_Acao", ""))
+    pa = eirox_v260_num(acao.get("Preco_Atual"))
+    ca = eirox_v260_num(acao.get("Custo_Oficial_Referencia"))
+    pe = eirox_v260_num(preco)
+    ce = eirox_v260_num(custo)
+    if tipo == "AJUSTAR PREÇO" and (pe is None or pe <= 0):
+        raise ValueError("Informe o preço efetivamente implantado.")
+    if tipo == "NEGOCIAR CUSTO" and (ce is None or ce <= 0):
+        raise ValueError("Informe o custo efetivamente negociado.")
+    if tipo == "REVISAR MERCADO" and pe is None and ce is None:
+        raise ValueError("Informe o resultado da revisão antes de registrar a execução.")
+    if tipo == "AJUSTAR PREÇO" and pa is None:
+        raise ValueError("Preço anterior não disponível. Atualize a referência antes de executar.")
+    if tipo == "NEGOCIAR CUSTO" and ca is None:
+        raise ValueError("Custo anterior não disponível. Atualize a referência antes de executar.")
+    data_exec = pd.to_datetime(data, errors="coerce")
+    if pd.isna(data_exec) or data_exec.date() > _dt.now().date():
+        raise ValueError("Informe uma data efetiva válida, não futura.")
+    agora = _dt.now().isoformat(timespec="seconds")
+    eid = uuid.uuid4().hex
+    with eirox_v260_db() as con:
+        con.execute("""INSERT INTO execucoes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+            eid, str(acao["ID_Acao"]), str(acao["EAN"]), tipo,
+            str(data), pa, pe, ca, ce,
+            eirox_v260_num(acao.get("Potencial_Identificado")),
+            eirox_v260_num(acao.get("Volume_Oficial_Referencia")),
+            str(acao.get("Mes_Volume_Oficial_Referencia", "")),
+            eirox_v250_usuario_atual(), str(observacao or ""), agora
+        ))
+    return eid
+
+
+def eirox_v260_ler(tabela):
+    if tabela not in ("execucoes", "apuracoes"):
+        raise ValueError("Tabela inválida.")
+    with eirox_v260_db() as con:
+        return pd.read_sql_query("SELECT * FROM " + tabela, con)
+
+
+def eirox_v260_historico_mensal(vendas):
+    """Histórico mensal agregado, preservando competência e custo total."""
+    cols = ["EAN", "competencia", "quantidade", "venda", "custo_total"]
+    if not isinstance(vendas, pd.DataFrame) or vendas.empty:
+        return pd.DataFrame(columns=cols)
+    b = vendas.copy()
+    def col(cands):
+        return eirox_v240_coluna_existente(b, cands)
+    ce = col(["EAN", "EAN (GTIN)", "GTIN", "Cód. Barras/Etiq.", "Código de Barras"])
+    cq = col(["Itens", "Quantidade", "Qtd", "Qtde", "Quantidade Vendida"])
+    cv = col(["Venda", "Valor Venda", "Faturamento", "Valor Líquido"])
+    cc = col(["Custo", "Custo Total", "Valor Custo"])
+    cm = col(["Ano-mês", "Ano-mes", "Competência", "Competencia", "Data Venda", "Data"])
+    if not all([ce, cq, cv, cc, cm]):
+        return pd.DataFrame(columns=cols)
+    b["EAN"] = eirox_v210_normalizar_ean(b[ce])
+    txt = b[cm].astype(str).str.strip()
+    ext = txt.str.extract(r"(20\d{2})\D*([01]\d)")
+    comp = pd.Series("", index=b.index, dtype=object)
+    ok = ext[0].notna() & ext[1].notna()
+    comp.loc[ok] = ext.loc[ok, 0] + "-" + ext.loc[ok, 1]
+    faltou = ~ok
+    if faltou.any():
+        dt = pd.to_datetime(b.loc[faltou, cm], errors="coerce", dayfirst=True)
+        comp.loc[faltou] = dt.dt.strftime("%Y-%m").fillna("")
+    b["competencia"] = comp
+    for origem, destino in [(cq,"quantidade"),(cv,"venda"),(cc,"custo_total")]:
+        b[destino] = _num(b[origem])
+    b = b[
+        b["EAN"].ne("") & b["competencia"].str.match(r"^20\d{2}-(0[1-9]|1[0-2])$")
+        & b["quantidade"].gt(0) & b["venda"].gt(0)
+    ].copy()
+    if b.empty:
+        return pd.DataFrame(columns=cols)
+    return b.groupby(["EAN","competencia"], as_index=False)[
+        ["quantidade","venda","custo_total"]
+    ].sum()
+
+
+def eirox_v260_apurar(vendas):
+    """Compara preço/custo executado com resultado observado, sem atribuição causal."""
+    from datetime import datetime as _dt
+    ex = eirox_v260_ler("execucoes")
+    mensal = eirox_v260_historico_mensal(vendas)
+    if ex.empty or mensal.empty:
+        return 0
+    mes_atual = pd.Timestamp.now().strftime("%Y-%m")
+    registros = []
+    for _, e in ex.iterrows():
+        inicio = pd.to_datetime(e["executado_em"], errors="coerce")
+        if pd.isna(inicio):
+            continue
+        # Somente competências inteiramente posteriores ao mês da execução.
+        # A base mensal não permite isolar vendas antes/depois dentro do mês.
+        for _, m in mensal[
+            (mensal["EAN"].eq(str(e["ean"])))
+            & (mensal["competencia"].gt(inicio.strftime("%Y-%m")))
+            & (mensal["competencia"].lt(mes_atual))
+        ].iterrows():
+            q = eirox_v260_num(m["quantidade"])
+            v = eirox_v260_num(m["venda"])
+            ct = eirox_v260_num(m["custo_total"])
+            if not q or not v or ct is None or ct <= 0:
+                continue
+            pm, cu = v/q, ct/q
+            pa = eirox_v260_num(e["preco_anterior"])
+            ca = eirox_v260_num(e["custo_anterior"])
+            tipo = str(e["tipo"])
+            resultado = None
+            motivo = ""
+            if tipo == "AJUSTAR PREÇO" and pa is not None:
+                resultado = (pm-pa)*q
+                motivo = "Variação observada do preço médio versus preço anterior, ao volume realizado."
+            elif tipo == "NEGOCIAR CUSTO" and ca is not None:
+                resultado = (ca-cu)*q
+                motivo = "Variação observada do custo unitário versus custo anterior, ao volume realizado."
+            else:
+                motivo = "Revisão de mercado sem resultado financeiro atribuível automaticamente."
+            status = "APURADO" if resultado is not None else "NÃO APURÁVEL"
+            rid = hashlib.sha256(f"{e['id']}|{m['competencia']}".encode()).hexdigest()[:32]
+            registros.append((
+                rid,e["id"],m["competencia"],q,v,ct,pm,cu,resultado,status,motivo,
+                _dt.now().isoformat(timespec="seconds")
+            ))
+    if registros:
+        with eirox_v260_db() as con:
+            con.executemany("""INSERT OR REPLACE INTO apuracoes VALUES
+                (?,?,?,?,?,?,?,?,?,?,?,?)""", registros)
+    return len(registros)
+
+
+def eirox_v260_render(base):
+    st.markdown("## 💰 Resultado Realizado")
+    st.caption("Registro de execução e comparação com vendas e custos observados em competências fechadas.")
+    acoes = eirox_v250_ler_acoes()
+    ex = eirox_v260_ler("execucoes")
+    ap = eirox_v260_ler("apuracoes")
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Ações registradas", len(ex))
+    c2.metric("Competências apuradas", len(ap))
+    c3.metric("Registros com resultado", int(ap["resultado_realizado"].notna().sum()) if not ap.empty else 0)
+    c4.metric("Ações concluídas", int(acoes["Status"].eq("CONCLUÍDO").sum()) if not acoes.empty else 0)
+    st.warning("Resultado observado não é lucro incremental causalmente comprovado. Variações de volume, mix, descontos e outros fatores podem influenciar a comparação. Não some resultados de ações sobrepostas nem os compare diretamente ao potencial identificado.")
+    st.markdown("### 1. Registrar execução")
+    if acoes.empty:
+        st.info("Adicione ações no Plano de Ações antes de registrar a execução.")
+    else:
+        elegiveis = acoes[~acoes["Status"].eq("CANCELADO")].copy()
+        if elegiveis.empty:
+            st.info("Não existem ações elegíveis.")
+        else:
+            labels = {f"{r['EAN']} | {r['Produto']} | {r['Tipo_Acao']}":r["ID_Acao"] for _,r in elegiveis.iterrows()}
+            escolha = st.selectbox("Ação",list(labels),key="v260_acao")
+            row = elegiveis[elegiveis["ID_Acao"].eq(labels[escolha])].iloc[0].to_dict()
+            # Referências são capturadas no momento do registro, não reescritas depois.
+            ref = base.copy()
+            ce = eirox_v240_coluna_existente(ref,["EAN_Oficial","EAN","EAN (GTIN)"])
+            if ce:
+                ref = ref[eirox_v210_normalizar_ean(ref[ce]).eq(str(row["EAN"]))]
+            if not ref.empty:
+                rr=ref.iloc[0]
+                row["Custo_Oficial_Referencia"]=rr.get("Custo_Oficial")
+                row["Volume_Oficial_Referencia"]=rr.get("Volume_Oficial")
+                row["Mes_Volume_Oficial_Referencia"]=rr.get("Mes_Volume_Oficial","")
+            with st.form("v260_registro"):
+                data=st.date_input("Data efetiva da execução",value=pd.Timestamp.now().date())
+                a,b=st.columns(2)
+                preco=a.number_input("Preço efetivamente implantado (R$)",min_value=0.0,value=0.0,format="%.2f")
+                custo=b.number_input("Custo efetivamente negociado (R$)",min_value=0.0,value=0.0,format="%.4f")
+                obs=st.text_area("Comprovante / observação da execução")
+                if st.form_submit_button("Registrar execução",type="primary"):
+                    try:
+                        eid=eirox_v260_registrar(row,data.isoformat(),preco or None,custo or None,obs)
+                        st.success("Execução registrada: "+eid[:12])
+                    except Exception as exc:
+                        st.error(str(exc))
+    st.markdown("### 2. Apuração por competência")
+    st.caption("Apenas meses inteiramente posteriores ao mês da execução. O mês atual e o mês da implantação ficam excluídos.")
+    if st.button("🔄 Apurar competências fechadas",key="v260_apurar"):
+        try:
+            qtd=eirox_v260_apurar(globals().get("venda_rede",pd.DataFrame()))
+            st.success(f"{qtd} registro(s) de competência processado(s).")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Falha na apuração: {exc}")
+    ex=eirox_v260_ler("execucoes")
+    ap=eirox_v260_ler("apuracoes")
+    if not ex.empty:
+        st.markdown("### 3. Histórico de execuções")
+        eirox_dataframe_brl(ex,use_container_width=True,hide_index=True)
+    if not ap.empty:
+        st.markdown("### 4. Resultado observado por competência")
+        eirox_dataframe_brl(ap,use_container_width=True,hide_index=True)
+        if globals().get("pode_exportar",True):
+            eirox_botao_excel_padrao(ap,titulo="Resultado Realizado — Eirox Pricing",
+                arquivo="Eirox_Resultado_Realizado.xlsx",key="v260_excel",use_container_width=True)
+    st.caption("Os registros ficam em SQLite local separado por contexto. Em hospedagem com disco efêmero, configure armazenamento persistente antes de utilizar como histórico definitivo.")
+
+
+
+# ==========================================================
+# EIROX PRICING 2.0 — FASE 7
+# NAVEGAÇÃO RÁPIDA + FILTROS CONSISTENTES + EXPORTAÇÃO GLOBAL
+# ==========================================================
+@st.cache_resource(show_spinner=False, max_entries=32)
+def eirox_v270_filtrar_base_cacheada(
+    assinatura_master,
+    chave_filtros,
+    _base,
+    laboratorios,
+    familias,
+    curvas,
+    busca,
+):
+    """Filtro leve reaproveitado entre trocas de tela com a mesma seleção."""
+    if not isinstance(_base, pd.DataFrame) or _base.empty:
+        return _base
+    d = _base
+    try:
+        if laboratorios and "Laboratório" in d.columns:
+            d = d[d["Laboratório"].isin(list(laboratorios))]
+        if familias and "Família" in d.columns:
+            d = d[d["Família"].isin(list(familias))]
+        if curvas and "CURVA" in d.columns:
+            d = d[d["CURVA"].isin(list(curvas))]
+        termo = str(busca or "").strip()
+        if termo:
+            mask = pd.Series(False, index=d.index)
+            if "Produto" in d.columns:
+                mask = mask | d["Produto"].astype(str).str.contains(
+                    termo, case=False, na=False, regex=False
+                )
+            if "EAN" in d.columns:
+                mask = mask | d["EAN"].astype(str).str.contains(
+                    termo, case=False, na=False, regex=False
+                )
+            d = d[mask]
+        return d.copy()
+    except Exception:
+        return _base.copy()
+
+
+def eirox_v270_resumo_analitico(base, pagina_atual):
+    """Resumo padronizado da seleção atual, sem recalcular regras comerciais."""
+    if not isinstance(base, pd.DataFrame):
+        base = pd.DataFrame()
+
+    def _num_col(cands):
+        for c in cands:
+            if c in base.columns:
+                return pd.to_numeric(base[c], errors="coerce")
+        return pd.Series(dtype="float64")
+
+    eans = 0
+    for c in ["EAN_Oficial", "EAN", "EAN (GTIN)", "GTIN"]:
+        if c in base.columns:
+            try:
+                eans = int(eirox_v210_normalizar_ean(base[c]).replace("", np.nan).nunique())
+            except Exception:
+                eans = int(base[c].nunique())
+            break
+
+    preco = _num_col(["Preco_Atual_Oficial", "Preço_Atual_Eirox", "Preco_Atual"])
+    custo = _num_col(["Custo_Oficial", "Custo"])
+    mercado = _num_col(["Preco_Mercado_Oficial", "Menor Preço Concorrente"])
+    volume = _num_col(["Volume_Oficial", "Itens_Mes_Fechado"])
+    ganho = _num_col(["Ganho_Potencial_Oficial", "Ganho_Potencial"])
+
+    linhas = [
+        ("Tela", str(pagina_atual)),
+        ("Registros filtrados", int(len(base))),
+        ("EANs distintos", eans),
+        ("Com preço válido", int(preco.gt(0).sum()) if not preco.empty else 0),
+        ("Com custo válido", int(custo.gt(0).sum()) if not custo.empty else 0),
+        ("Com mercado válido", int(mercado.gt(0).sum()) if not mercado.empty else 0),
+        ("Com volume válido", int(volume.gt(0).sum()) if not volume.empty else 0),
+        ("Ganho potencial disponível", float(ganho.fillna(0).sum()) if not ganho.empty else 0.0),
+        ("Gerado em", datetime.now().strftime("%d/%m/%Y %H:%M:%S")),
+    ]
+    return pd.DataFrame(linhas, columns=["Indicador", "Valor"])
+
+
+def eirox_v270_render_exportacao_global(base, pagina_atual, chave_filtros):
+    """
+    Exportação sob demanda: o Excel só é serializado após clique,
+    evitando custo desnecessário em cada troca de tela.
+    """
+    if not globals().get("pode_exportar", True):
+        return
+    if not isinstance(base, pd.DataFrame):
+        return
+
+    token = hashlib.sha256(
+        f"{globals().get('_eirox_sig_master','')}|{chave_filtros}|{pagina_atual}".encode("utf-8")
+    ).hexdigest()[:20]
+    key_dados = f"eirox_v270_excel_dados_{token}"
+    key_resumo = f"eirox_v270_excel_resumo_{token}"
+
+    with st.sidebar.expander("📤 Exportar esta seleção", expanded=False):
+        st.caption(str(pagina_atual))
+        st.caption(f"{len(base):,} registro(s) filtrado(s)".replace(",", "."))
+
+        if st.button(
+            "Preparar Excel detalhado",
+            key=f"eirox_v270_preparar_dados_{token}",
+            use_container_width=True,
+        ):
+            try:
+                st.session_state[key_dados] = eirox_excel_padrao_bytes(
+                    base,
+                    titulo=f"Eirox Pricing — {pagina_atual}",
+                    nome_aba="Dados",
+                )
+            except Exception as exc:
+                st.error(f"Não foi possível preparar o Excel: {exc}")
+
+        dados = st.session_state.get(key_dados)
+        if dados:
+            st.download_button(
+                "📊 Baixar Excel detalhado",
+                data=dados,
+                file_name=f"Eirox_{re.sub(r'[^A-Za-z0-9_-]+','_',str(pagina_atual)).strip('_')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"eirox_v270_download_dados_{token}",
+                use_container_width=True,
+            )
+
+        if st.button(
+            "Preparar resumo analítico",
+            key=f"eirox_v270_preparar_resumo_{token}",
+            use_container_width=True,
+        ):
+            try:
+                resumo = eirox_v270_resumo_analitico(base, pagina_atual)
+                st.session_state[key_resumo] = eirox_excel_padrao_bytes(
+                    resumo,
+                    titulo=f"Resumo Analítico — {pagina_atual}",
+                    nome_aba="Resumo",
+                )
+            except Exception as exc:
+                st.error(f"Não foi possível preparar o resumo: {exc}")
+
+        resumo_bytes = st.session_state.get(key_resumo)
+        if resumo_bytes:
+            st.download_button(
+                "📈 Baixar resumo analítico",
+                data=resumo_bytes,
+                file_name=f"Eirox_Resumo_{re.sub(r'[^A-Za-z0-9_-]+','_',str(pagina_atual)).strip('_')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"eirox_v270_download_resumo_{token}",
+                use_container_width=True,
+            )
+
+
+# ==========================================================
+# EIROX PRICING 2.0 — FASE 1
+# BASE ANALÍTICA PERSISTENTE + VIEWER LEVE
+# ==========================================================
+def eirox_v200_cache_analitico_dir():
+    pasta = Path(__file__).resolve().parent / "_cache_pricing" / "analitico_v200"
+    pasta.mkdir(parents=True, exist_ok=True)
+    return pasta
+
+
+def eirox_v200_caminhos_base_analitica(assinatura_master):
+    chave = hashlib.sha256(str(assinatura_master).encode("utf-8")).hexdigest()[:28]
+    pasta = eirox_v200_cache_analitico_dir()
+    return (
+        pasta / f"base_analitica_{chave}.parquet",
+        pasta / f"base_analitica_{chave}.pkl",
+        pasta / f"metadata_{chave}.json",
+    )
+
+
+def eirox_v200_base_analitica_valida(base):
+    try:
+        return isinstance(base, pd.DataFrame) and not base.empty and "EAN" in base.columns
+    except Exception:
+        return False
+
+
+@st.cache_resource(show_spinner=False, max_entries=8)
+def eirox_v200_carregar_base_analitica(assinatura_master):
+    """Carrega a base pronta sem reconstruir o motor durante a navegação."""
+    parquet_path, pkl_path, _ = eirox_v200_caminhos_base_analitica(assinatura_master)
+    if parquet_path.exists():
+        try:
+            base = pd.read_parquet(parquet_path)
+            if eirox_v200_base_analitica_valida(base):
+                return base
+        except Exception:
+            pass
+    if pkl_path.exists():
+        try:
+            base = pd.read_pickle(pkl_path)
+            if eirox_v200_base_analitica_valida(base):
+                return base
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
+def eirox_v200_salvar_base_analitica(
+    base,
+    assinatura_master,
+    assinatura_historico="",
+    assinatura_venda="",
+    assinatura_estoque="",
+    assinatura_compra="",
+):
+    """Publicação atômica: falha de atualização nunca substitui a última base válida."""
+    if not eirox_v200_base_analitica_valida(base):
+        return False
+
+    parquet_path, pkl_path, meta_path = eirox_v200_caminhos_base_analitica(assinatura_master)
+    pasta = parquet_path.parent
+    tmp_parquet = pasta / f".tmp_{parquet_path.name}"
+    tmp_pkl = pasta / f".tmp_{pkl_path.name}"
+    tmp_meta = pasta / f".tmp_{meta_path.name}"
+
+    salvo = False
+    formato = ""
+
+    try:
+        base.to_parquet(tmp_parquet, index=False)
+        os.replace(tmp_parquet, parquet_path)
+        salvo = True
+        formato = "PARQUET"
+        try:
+            pkl_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    except Exception:
+        try:
+            tmp_parquet.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if not salvo:
+        try:
+            base.to_pickle(tmp_pkl)
+            os.replace(tmp_pkl, pkl_path)
+            salvo = True
+            formato = "PICKLE"
+        except Exception:
+            try:
+                tmp_pkl.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    if not salvo:
+        return False
+
+    try:
+        meta = {
+            "versao_arquitetura": "Eirox Pricing 2.0 — Fase 1",
+            "gerado_em": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            "linhas": int(len(base)),
+            "colunas": int(len(base.columns)),
+            "formato": formato,
+            "assinatura_master": str(assinatura_master),
+            "assinatura_historico": str(assinatura_historico),
+            "assinatura_venda": str(assinatura_venda),
+            "assinatura_estoque": str(assinatura_estoque),
+            "assinatura_compra": str(assinatura_compra),
+        }
+        with open(tmp_meta, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_meta, meta_path)
+    except Exception:
+        try:
+            tmp_meta.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    try:
+        eirox_v200_carregar_base_analitica.clear()
+    except Exception:
+        pass
+    return True
+
+
+def eirox_v200_ler_metadata(assinatura_master):
+    try:
+        _, _, meta_path = eirox_v200_caminhos_base_analitica(assinatura_master)
+        if meta_path.exists():
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            return meta if isinstance(meta, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def eirox_v200_publicar_snapshot_atual(base):
+    try:
+        return eirox_v200_salvar_base_analitica(
+            base,
+            _eirox_sig_master,
+            _eirox_sig_historico,
+            _eirox_sig_venda,
+            _eirox_sig_estoque,
+            _eirox_sig_compra,
+        )
+    except Exception:
+        return False
+
 
 # --------------------------------------------------
 # DADOS
@@ -15316,6 +18281,9 @@ _eirox_sig_contexto = eirox_assinatura_contexto_performance()
 _eirox_sig_geo = eirox_assinatura_geo_performance()
 _eirox_sig_master = hashlib.sha256(
     "||".join([
+        EIROX_CORE_RULESET_ID,
+        EIROX_CLIENT_PROFILE["key"],
+        eirox_v280_core_signature(),
         _eirox_sig_historico,
         _eirox_sig_compra,
         _eirox_sig_venda,
@@ -15323,6 +18291,17 @@ _eirox_sig_master = hashlib.sha256(
         _eirox_sig_contexto,
     ]).encode("utf-8")
 ).hexdigest()
+
+# Fase 1 — consulta primeiro a base analítica já pronta.
+_eirox_v200_forcar_rebuild = bool(
+    st.session_state.pop("eirox_v200_forcar_rebuild", False)
+)
+_eirox_snapshot_v200 = (
+    pd.DataFrame()
+    if _eirox_v200_forcar_rebuild
+    else eirox_v200_carregar_base_analitica(_eirox_sig_master)
+)
+_eirox_snapshot_usado_v200 = eirox_v200_base_analitica_valida(_eirox_snapshot_v200)
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -15347,14 +18326,23 @@ historico = eirox_preprocessar_historico_cacheado(
     historico,
 )
 
+# V1.4.70 — auditoria sob demanda para não penalizar a primeira entrada.
 try:
-    auditoria = auditoria_pesquisa_atual()
-    if isinstance(auditoria, dict) and auditoria:
-        with st.sidebar.expander("🔎 Auditoria da pesquisa", expanded=False):
+    with st.sidebar.expander("🔎 Auditoria da pesquisa", expanded=False):
+        if st.button("Carregar auditoria", key="eirox_v170_carregar_auditoria"):
+            try:
+                st.session_state["eirox_v170_auditoria"] = auditoria_pesquisa_atual()
+            except Exception:
+                st.session_state["eirox_v170_auditoria"] = {}
+
+        auditoria = st.session_state.get("eirox_v170_auditoria", {})
+        if isinstance(auditoria, dict) and auditoria:
             st.caption(f"Linhas lidas: {auditoria.get('linhas_antes', 0)}")
             st.caption(f"Linhas válidas: {auditoria.get('linhas_depois', 0)}")
             st.caption(f"Duplicadas removidas: {auditoria.get('duplicadas_removidas', 0)}")
             st.caption(f"Chave: {auditoria.get('chave_usada', '')}")
+        else:
+            st.caption("Auditoria carregada somente quando solicitada.")
 except Exception:
     pass
 
@@ -15374,17 +18362,50 @@ estoque = eirox_classificar_base_cacheada(
     "Estoque", _eirox_sig_estoque, _eirox_sig_contexto, estoque
 )
 
-df = eirox_processar_base_master_cacheada(
-    _eirox_sig_historico,
-    _eirox_sig_compra,
-    _eirox_sig_venda,
-    _eirox_sig_estoque,
-    _eirox_sig_contexto,
-    historico,
-    compra,
-    venda_rede,
-    estoque,
-).copy()
+if _eirox_snapshot_usado_v200:
+    df = _eirox_snapshot_v200.copy(deep=False)
+else:
+    df = eirox_processar_base_master_cacheada(
+        _eirox_sig_historico,
+        _eirox_sig_compra,
+        _eirox_sig_venda,
+        _eirox_sig_estoque,
+        _eirox_sig_contexto,
+        historico,
+        compra,
+        venda_rede,
+        estoque,
+    ).copy(deep=False)
+    eirox_v200_publicar_snapshot_atual(df)
+
+# Fase 2 — consolida a camada oficial. Snapshots antigos da Fase 1 são
+# enriquecidos uma única vez e republicados já com rastreabilidade completa.
+_eirox_precisou_camada_v210 = (
+    isinstance(df, pd.DataFrame)
+    and not df.empty
+    and (
+        "Preco_Atual_Oficial" not in df.columns
+        or "Custo_Oficial" not in df.columns
+        or "Preco_Mercado_Oficial" not in df.columns
+        or "Volume_Oficial" not in df.columns
+        or "Regra_Preco_Oficial_Versao" not in df.columns
+        or not df.get(
+            "Regra_Preco_Oficial_Versao",
+            pd.Series("", index=df.index)
+        ).astype(str).eq("V7.1-STRICT-20260909").all()
+    )
+)
+if _eirox_precisou_camada_v210:
+    df = eirox_v210_camada_oficial_cacheada(
+        _eirox_sig_master,
+        _eirox_sig_historico,
+        _eirox_sig_venda,
+        _eirox_sig_contexto,
+        df,
+        historico,
+        venda_rede,
+    ).copy(deep=False)
+    eirox_v200_publicar_snapshot_atual(df)
 
 if historico.empty:
     historico = ler_base_pasta_ou_zip(
@@ -15496,7 +18517,7 @@ _eirox_cloud_precisou_fallback = any([
     _eirox_primeira_estoque_vazia,
 ])
 
-if _eirox_cloud_precisou_fallback:
+if _eirox_cloud_precisou_fallback and not _eirox_snapshot_usado_v200:
     try:
         # Aplica as mesmas camadas de preparação usadas na carga normal.
         if isinstance(historico, pd.DataFrame) and not historico.empty:
@@ -15531,13 +18552,33 @@ if _eirox_cloud_precisou_fallback:
             compra,
             venda_rede,
             estoque,
-        ).copy()
+        ).copy(deep=False)
+        df = eirox_v210_camada_oficial_cacheada(
+            _eirox_sig_master,
+            _eirox_sig_historico,
+            _eirox_sig_venda,
+            _eirox_sig_contexto,
+            df,
+            historico,
+            venda_rede,
+        ).copy(deep=False)
+        eirox_v200_publicar_snapshot_atual(df)
     except Exception:
         # Segurança: nunca derruba o app por causa da camada de paridade.
         try:
             df = construir_base_pricing_somente_pastas(
                 historico, compra, venda_rede, estoque
             )
+            df = eirox_v210_camada_oficial_cacheada(
+                _eirox_sig_master,
+                _eirox_sig_historico,
+                _eirox_sig_venda,
+                _eirox_sig_contexto,
+                df,
+                historico,
+                venda_rede,
+            ).copy(deep=False)
+            eirox_v200_publicar_snapshot_atual(df)
         except Exception:
             pass
 
@@ -15627,17 +18668,34 @@ if not historico.empty:
 simulacao_global = pd.DataFrame()
 origem_simulacao_global = "sem_calculo"
 
-df, simulacao_global, origem_simulacao_global = eirox_recalcular_ganho_cacheado(
-    _eirox_sig_master,
-    _eirox_sig_venda,
-    _eirox_sig_historico,
-    _eirox_sig_contexto,
-    df,
-    venda_rede,
-    historico,
+# V1.4.70 — PRIMEIRA ENTRADA RÁPIDA.
+# O Dashboard Geral recalcula seu simulador financeiro unificado mais abaixo
+# (V1.4.59). Portanto, executar aqui o simulador antigo inteiro era trabalho
+# duplicado justamente na página inicial.
+_eirox_pagina_hint_v170 = st.session_state.get(
+    "eirox_pagina_global",
+    "📊 Dashboard Geral"
+)
+_eirox_dashboard_inicial_v170 = (
+    str(_eirox_pagina_hint_v170).strip() == "📊 Dashboard Geral"
 )
 
-# Ganho potencial único para todas as visões e indicadores.
+if not _eirox_dashboard_inicial_v170:
+    df, simulacao_global, origem_simulacao_global = eirox_recalcular_ganho_cacheado(
+        _eirox_sig_master,
+        _eirox_sig_venda,
+        _eirox_sig_historico,
+        _eirox_sig_contexto,
+        df,
+        venda_rede,
+        historico,
+    )
+else:
+    # Mantém os ganhos que já saem da base mestre; o valor financeiro
+    # definitivo do Dashboard é calculado pelo motor unificado da própria tela.
+    origem_simulacao_global = "adiado_dashboard_v170"
+
+# Cria somente os aliases necessários, sem recalcular o motor.
 df = propagar_ganho_potencial(df)
 
 if isinstance(simulacao_global, pd.DataFrame) and not simulacao_global.empty:
@@ -15659,7 +18717,7 @@ if isinstance(simulacao_global, pd.DataFrame) and not simulacao_global.empty:
 try:
 
     st.sidebar.image(
-        "logo insightfarma.png",
+        EIROX_CLIENT_PROFILE["logo"],
     )
 
 except Exception:
@@ -15798,6 +18856,1401 @@ except Exception:
 
 
 
+
+# ================================================================
+# PRIORIDADE DE PESQUISA — V1.4.36
+# Cadastro operacional dos produtos prioritários para pesquisa.
+# A fila é isolada por empresa/cliente e pode ser exportada/importada.
+# ================================================================
+PRIORIDADE_PESQUISA_ARQUIVO = Path(__file__).resolve().parent / "PRIORIDADE_PESQUISA.csv"
+
+
+def _prio_normalizar_ean(valor):
+    try:
+        s = str(valor or "").strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return re.sub(r"\D", "", s)
+    except Exception:
+        return ""
+
+
+def _prio_empresa_id():
+    try:
+        if "empresa_contexto_atual" in globals():
+            v = empresa_contexto_atual()
+            if v not in (None, ""):
+                return str(v)
+    except Exception:
+        pass
+    return str(st.session_state.get("empresa_id_usuario", "1") or "1")
+
+
+def _prio_coluna(base, candidatos):
+    if not isinstance(base, pd.DataFrame):
+        return None
+    norm = {re.sub(r"[^a-z0-9]", "", str(c).lower()): c for c in base.columns}
+    for cand in candidatos:
+        k = re.sub(r"[^a-z0-9]", "", str(cand).lower())
+        if k in norm:
+            return norm[k]
+    return None
+
+
+def _prio_carregar():
+    cols = ["EmpresaID", "Ordem", "EAN", "Produto", "Prioridade", "Ativo", "Origem", "Observacao", "AtualizadoEm"]
+    try:
+        if PRIORIDADE_PESQUISA_ARQUIVO.exists():
+            out = pd.read_csv(PRIORIDADE_PESQUISA_ARQUIVO, sep=";", dtype=str, encoding="utf-8-sig")
+        else:
+            out = pd.DataFrame(columns=cols)
+    except Exception:
+        out = pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in out.columns:
+            out[c] = ""
+    out = out[cols].copy()
+    out["EAN"] = out["EAN"].apply(_prio_normalizar_ean)
+    out["Ativo"] = out["Ativo"].astype(str).str.lower().isin(["1", "true", "sim", "yes", "s", "x"])
+    out["Ordem"] = pd.to_numeric(out["Ordem"], errors="coerce")
+    return out
+
+
+def _prio_salvar(base):
+    try:
+        out = base.copy()
+        out["EAN"] = out["EAN"].apply(_prio_normalizar_ean)
+        out = out[out["EAN"].str.len().gt(0)].copy()
+        out = out.drop_duplicates(["EmpresaID", "EAN"], keep="last")
+        tmp = PRIORIDADE_PESQUISA_ARQUIVO.with_suffix(".tmp")
+        out.to_csv(tmp, sep=";", index=False, encoding="utf-8-sig")
+        tmp.replace(PRIORIDADE_PESQUISA_ARQUIVO)
+        return True, ""
+    except Exception as exc:
+        st.session_state["prioridade_pesquisa_fallback"] = base.copy()
+        return False, str(exc)
+
+
+def _prio_base_empresa():
+    emp = _prio_empresa_id()
+    base = _prio_carregar()
+    atual = base[base["EmpresaID"].astype(str) == emp].copy()
+    # O arquivo inicial vem com EmpresaID=* e é clonado somente no primeiro uso da empresa.
+    if atual.empty:
+        seed = base[base["EmpresaID"].astype(str) == "*"].copy()
+        if not seed.empty:
+            seed["EmpresaID"] = emp
+            seed["AtualizadoEm"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+            base = pd.concat([base, seed], ignore_index=True)
+            _prio_salvar(base)
+            atual = seed.copy()
+    return base, atual
+
+
+def _prio_resumo_pesquisa(prioridades, dados):
+    p = prioridades.copy()
+    if p.empty:
+        return p
+    p["EAN"] = p["EAN"].apply(_prio_normalizar_ean)
+    p["Prioridade"] = p["Prioridade"].replace("", "1 - Crítica")
+    rank = {"1 - Crítica": 1, "2 - Alta": 2, "3 - Normal": 3}
+    p["_rank"] = p["Prioridade"].map(rank).fillna(9)
+
+    if not isinstance(dados, pd.DataFrame) or dados.empty:
+        p["Status Pesquisa"] = "⏳ Pendente"
+        p["Qtd. Registros"] = 0
+        p["Data mais recente"] = ""
+        return p.sort_values(["_rank", "Ordem"], na_position="last")
+
+    ean_col = _prio_coluna(dados, ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras", "Codigo de Barras", "codigobarras"])
+    data_col = _prio_coluna(dados, ["Data da Pesquisa", "Data Pesquisa", "Data_Pesquisa", "Data Emissão", "Data", "Data Emissao"])
+    if not ean_col:
+        p["Status Pesquisa"] = "⏳ Pendente"
+        p["Qtd. Registros"] = 0
+        p["Data mais recente"] = ""
+        return p.sort_values(["_rank", "Ordem"], na_position="last")
+
+    d = dados.copy()
+    d["_EAN_PRIO"] = d[ean_col].apply(_prio_normalizar_ean)
+    d = d[d["_EAN_PRIO"].str.len().gt(0)]
+    agg = d.groupby("_EAN_PRIO", as_index=False).size().rename(columns={"size": "Qtd. Registros"})
+    if data_col:
+        dd = d[["_EAN_PRIO", data_col]].copy()
+        dd["_DATA_PRIO"] = pd.to_datetime(dd[data_col], errors="coerce", dayfirst=True)
+        ult = dd.groupby("_EAN_PRIO", as_index=False)["_DATA_PRIO"].max()
+        ult["Data mais recente"] = ult["_DATA_PRIO"].dt.strftime("%d/%m/%Y").fillna("")
+        agg = agg.merge(ult[["_EAN_PRIO", "Data mais recente"]], on="_EAN_PRIO", how="left")
+    else:
+        agg["Data mais recente"] = ""
+
+    p = p.merge(agg, left_on="EAN", right_on="_EAN_PRIO", how="left")
+    p["Qtd. Registros"] = pd.to_numeric(p["Qtd. Registros"], errors="coerce").fillna(0).astype(int)
+    p["Data mais recente"] = p["Data mais recente"].fillna("")
+    p["Status Pesquisa"] = p["Qtd. Registros"].gt(0).map({True: "✅ Pesquisado", False: "⏳ Pendente"})
+    p = p.drop(columns=["_EAN_PRIO"], errors="ignore")
+
+    # V8.14 — corrige o quadro superior usando as fontes reais.
+    # Data mais recente: última Data Emissão física da VENDA_TESTE por EAN.
+    try:
+        _raw_v814 = eirox_v813_mapa_pesquisas_reais()
+        if isinstance(_raw_v814, pd.DataFrame) and not _raw_v814.empty:
+            _raw_valid_v814 = _raw_v814[
+                _raw_v814["EAN_V813"].astype(str).str.len().gt(0)
+            ].copy()
+
+            _qtd_v814 = _raw_valid_v814["EAN_V813"].value_counts()
+            p["Qtd. Registros"] = (
+                p["EAN"].map(_qtd_v814).fillna(0).astype(int)
+            )
+
+            _datas_v814 = _raw_valid_v814.dropna(
+                subset=["Data_Emissao_V813"]
+            )
+            if not _datas_v814.empty:
+                _ult_v814 = (
+                    _datas_v814.groupby("EAN_V813")["Data_Emissao_V813"].max()
+                )
+                _dt_v814 = p["EAN"].map(_ult_v814)
+                p["Data mais recente"] = _dt_v814.apply(
+                    lambda x: x.strftime("%d/%m/%Y %H:%M:%S")
+                    if pd.notna(x) else ""
+                )
+            else:
+                p["Data mais recente"] = ""
+
+            p["Status Pesquisa"] = p["Qtd. Registros"].gt(0).map(
+                {True: "✅ Pesquisado", False: "⏳ Pendente"}
+            )
+    except Exception:
+        pass
+
+    # Média Venda/Dia: último mês fechado da VENDA_FINAL_TESTE.
+    try:
+        _fechado_v814 = eirox_v158_ultimo_mes_fechado_memoria(
+            globals().get("venda_rede", pd.DataFrame())
+        )
+        if isinstance(_fechado_v814, pd.DataFrame) and not _fechado_v814.empty:
+            _fv814 = _fechado_v814.copy()
+            _fv814["__EAN_V814"] = _fv814["EAN"].apply(_prio_normalizar_ean)
+            _fv814 = _fv814.drop_duplicates("__EAN_V814", keep="last")
+
+            _lk_itens_v814 = _fv814.set_index("__EAN_V814")["Itens_Mes_Fechado"]
+            _lk_valor_v816 = _fv814.set_index("__EAN_V814")["Venda_Mes_Fechado"]
+
+            _itens_v814 = pd.to_numeric(
+                p["EAN"].map(_lk_itens_v814), errors="coerce"
+            )
+            _valor_v816 = pd.to_numeric(
+                p["EAN"].map(_lk_valor_v816), errors="coerce"
+            )
+
+            # V8.16 — média/venda do último mês fechado em UNIDADES e VALOR.
+            p["Média Venda/Mês (Unid.)"] = _itens_v814.round(0).astype("Int64")
+            p["Média Venda/Mês (R$)"] = _valor_v816.round(2)
+        else:
+            p["Média Venda/Mês (Unid.)"] = np.nan
+            p["Média Venda/Mês (R$)"] = np.nan
+    except Exception:
+        p["Média Venda/Mês (Unid.)"] = np.nan
+        p["Média Venda/Mês (R$)"] = np.nan
+
+    return p.sort_values(["_rank", "Ordem"], na_position="last")
+
+
+
+
+def eirox_v285_lab_valido(valor):
+    txt = "" if pd.isna(valor) else str(valor).strip()
+    return bool(
+        txt
+        and txt.lower() not in {
+            "nan", "none", "null", "não informado", "nao informado",
+            "laboratório pendente", "laboratorio pendente", "-", "--"
+        }
+    )
+
+
+def eirox_v285_mapa_laboratorio(base, nome_fonte):
+    """Retorna um laboratório/fabricante cadastral válido por EAN."""
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return pd.DataFrame(columns=["EAN_V285", "Laboratório_V285", "Fonte_Laboratório_V285"])
+
+    d = eirox_normalizar_colunas_planilha(base.copy())
+    ce = eirox_coluna(
+        d,
+        ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras", "Codigo de Barras",
+         "codigobarras", "Cód. Barras/Etiq.", "Cod Barras", "Barras"]
+    )
+    cl = eirox_coluna(
+        d,
+        ["Laboratório", "Laboratorio", "LABORATORIO",
+         "Fabricante", "FABRICANTE", "Marca", "MARCA"]
+    )
+    if not ce or not cl:
+        return pd.DataFrame(columns=["EAN_V285", "Laboratório_V285", "Fonte_Laboratório_V285"])
+
+    x = pd.DataFrame({
+        "EAN_V285": d[ce].apply(_prio_normalizar_ean),
+        "Laboratório_V285": d[cl].fillna("").astype(str).str.strip(),
+    })
+    x = x[
+        x["EAN_V285"].str.len().gt(0)
+        & x["Laboratório_V285"].apply(eirox_v285_lab_valido)
+    ].copy()
+    if x.empty:
+        return pd.DataFrame(columns=["EAN_V285", "Laboratório_V285", "Fonte_Laboratório_V285"])
+
+    # Em caso de repetição do EAN, usa o laboratório válido mais frequente da fonte.
+    x = (
+        x.groupby("EAN_V285", as_index=False)["Laboratório_V285"]
+        .agg(lambda s: s.value_counts(dropna=True).index[0] if not s.empty else "")
+    )
+    x["Fonte_Laboratório_V285"] = nome_fonte
+    return x
+
+
+def eirox_v285_enriquecer_laboratorio_prioritarios(out, dados_principal):
+    """
+    Hierarquia cadastral por EAN:
+    BASE PRINCIPAL → ESTOQUE_TESTE → COMPRA_TESTE → VENDA_FINAL_TESTE → VENDA_TESTE.
+    COMPRA_TESTE é usada aqui SOMENTE para cadastro de laboratório/fabricante.
+    """
+    if not isinstance(out, pd.DataFrame) or out.empty or "EAN" not in out.columns:
+        return out
+
+    r = out.copy()
+    keys = r["EAN"].apply(_prio_normalizar_ean)
+    lab_final = pd.Series("", index=r.index, dtype="object")
+    fonte_final = pd.Series("", index=r.index, dtype="object")
+
+    fontes = [
+        (dados_principal, "BASE PRINCIPAL"),
+        (globals().get("estoque", pd.DataFrame()), "ESTOQUE_TESTE"),
+        (globals().get("compra", pd.DataFrame()), "COMPRA_TESTE"),
+        (globals().get("venda_rede", pd.DataFrame()), "VENDA_FINAL_TESTE"),
+        (globals().get("historico", pd.DataFrame()), "VENDA_TESTE"),
+    ]
+
+    for base_fonte, nome_fonte in fontes:
+        mapa = eirox_v285_mapa_laboratorio(base_fonte, nome_fonte)
+        if mapa.empty:
+            continue
+        lk_lab = mapa.set_index("EAN_V285")["Laboratório_V285"]
+        candidato = keys.map(lk_lab).fillna("").astype(str).str.strip()
+        preencher = ~lab_final.apply(eirox_v285_lab_valido) & candidato.apply(eirox_v285_lab_valido)
+        lab_final.loc[preencher] = candidato.loc[preencher]
+        fonte_final.loc[preencher] = nome_fonte
+
+    pendente = ~lab_final.apply(eirox_v285_lab_valido)
+    lab_final.loc[pendente] = "LABORATÓRIO PENDENTE"
+    fonte_final.loc[pendente] = "NÃO LOCALIZADO NAS BASES"
+
+    r["Laboratório"] = lab_final
+    r["Fonte Laboratório"] = fonte_final
+    return r
+
+
+
+def eirox_v286_familia_valida(valor):
+    txt = "" if pd.isna(valor) else str(valor).strip()
+    return bool(
+        txt
+        and txt.lower() not in {
+            "nan", "none", "null", "não informado", "nao informado",
+            "família pendente", "familia pendente", "-", "--"
+        }
+    )
+
+
+def eirox_v286_mapa_familia(base, nome_fonte):
+    """Retorna a classificação de família válida por EAN."""
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return pd.DataFrame(columns=["EAN_V286", "Família_V286", "Fonte_Família_V286"])
+
+    d = eirox_normalizar_colunas_planilha(base.copy())
+    ce = eirox_coluna(
+        d,
+        ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras", "Codigo de Barras",
+         "codigobarras", "Cód. Barras/Etiq.", "Cod Barras", "Barras"]
+    )
+    cf = eirox_coluna(
+        d,
+        ["Família", "Familia", "FAMÍLIA", "FAMILIA",
+         "Classificação", "Classificacao",
+         "Classificação Principal", "Classificacao Principal",
+         "Categoria", "Caminho"]
+    )
+    if not ce or not cf:
+        return pd.DataFrame(columns=["EAN_V286", "Família_V286", "Fonte_Família_V286"])
+
+    x = pd.DataFrame({
+        "EAN_V286": d[ce].apply(_prio_normalizar_ean),
+        "Família_V286": d[cf].fillna("").astype(str).str.strip(),
+    })
+    x = x[
+        x["EAN_V286"].str.len().gt(0)
+        & x["Família_V286"].apply(eirox_v286_familia_valida)
+    ].copy()
+    if x.empty:
+        return pd.DataFrame(columns=["EAN_V286", "Família_V286", "Fonte_Família_V286"])
+
+    # Em duplicidade, preserva a classificação válida mais recorrente da fonte.
+    x = (
+        x.groupby("EAN_V286", as_index=False)["Família_V286"]
+        .agg(lambda s: s.value_counts(dropna=True).index[0] if not s.empty else "")
+    )
+    x["Fonte_Família_V286"] = nome_fonte
+    return x
+
+
+def eirox_v286_enriquecer_familia_prioritarios(out, dados_principal):
+    """
+    Hierarquia cadastral por EAN:
+    BASE PRINCIPAL → ESTOQUE_TESTE → COMPRA_TESTE → VENDA_FINAL_TESTE → VENDA_TESTE.
+    COMPRA_TESTE é usada aqui SOMENTE para classificação/cadastro.
+    """
+    if not isinstance(out, pd.DataFrame) or out.empty or "EAN" not in out.columns:
+        return out
+
+    r = out.copy()
+    keys = r["EAN"].apply(_prio_normalizar_ean)
+    familia_final = pd.Series("", index=r.index, dtype="object")
+    fonte_final = pd.Series("", index=r.index, dtype="object")
+
+    fontes = [
+        (dados_principal, "BASE PRINCIPAL"),
+        (globals().get("estoque", pd.DataFrame()), "ESTOQUE_TESTE"),
+        (globals().get("compra", pd.DataFrame()), "COMPRA_TESTE"),
+        (globals().get("venda_rede", pd.DataFrame()), "VENDA_FINAL_TESTE"),
+        (globals().get("historico", pd.DataFrame()), "VENDA_TESTE"),
+    ]
+
+    for base_fonte, nome_fonte in fontes:
+        mapa = eirox_v286_mapa_familia(base_fonte, nome_fonte)
+        if mapa.empty:
+            continue
+        lk = mapa.set_index("EAN_V286")["Família_V286"]
+        candidato = keys.map(lk).fillna("").astype(str).str.strip()
+        preencher = ~familia_final.apply(eirox_v286_familia_valida) & candidato.apply(eirox_v286_familia_valida)
+        familia_final.loc[preencher] = candidato.loc[preencher]
+        fonte_final.loc[preencher] = nome_fonte
+
+    pendente = ~familia_final.apply(eirox_v286_familia_valida)
+    familia_final.loc[pendente] = "FAMÍLIA PENDENTE"
+    fonte_final.loc[pendente] = "NÃO LOCALIZADA NAS BASES"
+
+    r["Família"] = familia_final
+    r["Fonte Família"] = fonte_final
+    return r
+
+
+def eirox_v282_analise_prioritarios(prioridades, dados):
+    """Análise financeira/comercial completa dos EANs ativos da Prioridade de Pesquisa."""
+    if not isinstance(prioridades, pd.DataFrame) or prioridades.empty:
+        return pd.DataFrame()
+    if not isinstance(dados, pd.DataFrame) or dados.empty:
+        return pd.DataFrame()
+
+    p = prioridades.copy()
+    p["EAN"] = p["EAN"].apply(_prio_normalizar_ean)
+    p = p[p["EAN"].str.len().gt(0)].drop_duplicates("EAN", keep="first")
+
+    try:
+        m = eirox_motor_oportunidades(dados.copy())
+    except Exception:
+        m = dados.copy()
+
+    if not isinstance(m, pd.DataFrame) or m.empty:
+        return pd.DataFrame()
+
+    ce = _prio_coluna(m, ["EAN_Oficial", "EAN", "EAN (GTIN)", "GTIN", "Código de Barras"])
+    if not ce:
+        return pd.DataFrame()
+
+    m = m.copy()
+    m["_EAN_V282"] = m[ce].apply(_prio_normalizar_ean)
+    m = m[m["_EAN_V282"].isin(set(p["EAN"]))].copy()
+    if m.empty:
+        return pd.DataFrame()
+
+    # Uma linha por EAN. O motor já carrega a verdade financeira corrente.
+    m = m.drop_duplicates("_EAN_V282", keep="first")
+    idx = m.set_index("_EAN_V282")
+
+    out = p[["Ordem","Prioridade","EAN","Produto"]].copy()
+    keys = out["EAN"]
+
+    def mapcol(cands, default=np.nan):
+        for c in cands:
+            if c in idx.columns:
+                return keys.map(idx[c])
+        return pd.Series(default, index=out.index)
+
+    # Cadastro / identificação
+    prod_motor = mapcol(["Produto","Descrição","Descricao"], "")
+    out["Produto"] = out["Produto"].where(
+        out["Produto"].astype(str).str.strip().ne(""),
+        prod_motor.fillna("").astype(str)
+    )
+    out["Laboratório"] = mapcol(["Laboratório","Laboratorio","Fabricante"], "")
+    # V8.5 — laboratório/fabricante não pode permanecer incompleto.
+    # Busca cadastral por EAN nas fontes oficiais, sem alterar regras de custo.
+    out = eirox_v285_enriquecer_laboratorio_prioritarios(out, dados)
+    out["Família"] = mapcol(["Família","Familia"], "")
+    # V8.6 — família/classificação cadastral não pode ficar "Não informado".
+    out = eirox_v286_enriquecer_familia_prioritarios(out, dados)
+    out["Curva"] = mapcol(["CURVA","Curva"], "")
+
+    # Preço atual — regra estrita V7.1
+    out["Preço Atual"] = pd.to_numeric(
+        mapcol(["Preço_Atual_Eirox","Preco_Atual_Oficial","Preco_Ultima_Venda"]),
+        errors="coerce"
+    )
+    fonte = mapcol(["Fonte_Preço_Eirox","Fonte_Preco_Oficial"], "").fillna("").astype(str)
+    out["Fonte Preço Atual"] = fonte.replace({
+        "ÚLTIMA VENDA": "VENDA_TESTE — ÚLTIMA PESQUISA PRINCIPAL",
+        "ÚLTIMO MÊS FECHADO": "VENDA_FINAL_TESTE — ÚLTIMO MÊS FECHADO",
+    })
+
+    data_preco = mapcol(["Data_Preco_Oficial","Data_Ultima_Venda"], "")
+    mes_preco = mapcol(["Mes_Fechado_Referencia","Mes_Custo_Oficial"], "")
+    out["Data/Competência Preço"] = [
+        str(d).strip() if str(d).strip().lower() not in {"","nan","nat","none"} else str(mm).strip()
+        for d,mm in zip(data_preco,mes_preco)
+    ]
+
+    # Mercado / concorrência
+    out["Menor Preço Concorrente"] = pd.to_numeric(
+        mapcol(["Preço_Mercado_Eirox","Preco_Mercado_Oficial","Menor Preço Concorrente"]),
+        errors="coerce"
+    )
+    out["Loja Menor Preço"] = mapcol(
+        ["Loja_Mercado_Oficial","Loja do Menor Preço","Loja_Menor_Preco"], ""
+    )
+    out["Data Pesquisa Mercado"] = mapcol(
+        ["Data_Mercado_Oficial","Data da Pesquisa","Data Pesquisa"], ""
+    )
+
+    # Custo / margem
+    out["Custo Unitário"] = pd.to_numeric(
+        mapcol(["Custo_Oficial","Custo_Unitario_Eirox","Custo"]), errors="coerce"
+    )
+    out["Fonte Custo"] = mapcol(
+        ["Fonte_Custo_Oficial_2_0","Fonte_Custo"], ""
+    )
+    out["Motivo Custo"] = mapcol(
+        ["Motivo_Custo_Oficial","Motivo_Sem_Custo"], ""
+    )
+    out["Margem Atual %"] = (
+        (out["Preço Atual"] - out["Custo Unitário"])
+        / out["Preço Atual"].replace(0, np.nan) * 100
+    )
+
+    # Recomendação e preço sugerido do mesmo motor central.
+    out["Recomendação"] = mapcol(
+        ["Recomendacao_Central","Recomendacao_Oficial","Recomendacao"], ""
+    )
+    out["Preço Sugerido"] = pd.to_numeric(
+        mapcol(["Preço_Sugerido_Eirox","Preco_Sugerido_Mercado"]), errors="coerce"
+    )
+
+    # Volume / competência / faturamento
+    out["Volume Último Mês"] = pd.to_numeric(
+        mapcol(["Volume_Oficial","Itens_Mes_Fechado","Qtd_Vendida_Eirox"]),
+        errors="coerce"
+    )
+    out["Faturamento Último Mês"] = pd.to_numeric(
+        mapcol(["Faturamento_Mes_Oficial","Venda_Mes_Fechado"]), errors="coerce"
+    )
+    out["Competência Volume"] = mapcol(
+        ["Mes_Volume_Oficial","Mes_Fechado_Referencia"], ""
+    )
+
+    # V8.4 — substitui Observação pela Média de Venda diária.
+    # Competência é mês fechado: Volume Último Mês / quantidade de dias do mês.
+    def _v284_dias_competencia(valor):
+        try:
+            dt = pd.to_datetime(str(valor).strip(), errors="coerce")
+            if pd.notna(dt):
+                return calendar.monthrange(int(dt.year), int(dt.month))[1]
+            txt = str(valor).strip()
+            mt = re.search(r"(20\\d{2})[-/](\\d{1,2})", txt)
+            if mt:
+                return calendar.monthrange(int(mt.group(1)), int(mt.group(2)))[1]
+        except Exception:
+            pass
+        return np.nan
+
+    _dias_v284 = out["Competência Volume"].apply(_v284_dias_competencia)
+    out["Média Venda/Dia"] = (
+        pd.to_numeric(out["Volume Último Mês"], errors="coerce")
+        / pd.to_numeric(_dias_v284, errors="coerce")
+    )
+
+    # Potencial: prioriza o ganho calculado pelo motor corrente para SUBIR PREÇO.
+    ganho_motor = pd.to_numeric(
+        mapcol(["Ganho_Lucro_Potencial_Eirox"]), errors="coerce"
+    ).fillna(0)
+    ganho_oficial = pd.to_numeric(
+        mapcol(["Ganho_Potencial_Oficial","Ganho_Potencial"]), errors="coerce"
+    ).fillna(0)
+    out["Ganho Potencial"] = np.where(
+        out["Recomendação"].astype(str).eq("SUBIR PREÇO"),
+        ganho_motor,
+        ganho_oficial
+    )
+
+    # Qualidade / pendências
+    out["Cobertura Dados %"] = pd.to_numeric(
+        mapcol(["Cobertura_Dado_Oficial_%"]), errors="coerce"
+    )
+    out["Pendências de Dados"] = mapcol(
+        ["Pendencias_Dado_Oficial"], ""
+    )
+    out["Status Dados"] = mapcol(
+        ["Status_Dado_Oficial"], ""
+    )
+
+    # Status de pesquisa da própria fila.
+    fila = _prio_resumo_pesquisa(p, dados)
+    if isinstance(fila, pd.DataFrame) and not fila.empty:
+        ff = fila.drop_duplicates("EAN").set_index("EAN")
+        out["Status Pesquisa"] = keys.map(ff["Status Pesquisa"])
+        out["Qtd. Pesquisas"] = keys.map(ff["Qtd. Registros"])
+        out["Última Pesquisa"] = keys.map(ff["Data mais recente"])
+
+    # V8.3 — nenhum campo textual fica visualmente vazio.
+    # Valores financeiros sem fonte continuam nulos: não inventamos preço/custo/mercado/volume.
+    _texto_padrao_v283 = {
+        "Família": "Não informado",
+        "Curva": "Não informado",
+        "Fonte Preço Atual": "SEM PREÇO",
+        "Data/Competência Preço": "Sem data/competência",
+        "Loja Menor Preço": "Sem pesquisa concorrente",
+        "Data Pesquisa Mercado": "Sem data na fonte",
+        "Fonte Custo": "SEM CUSTO",
+        "Motivo Custo": "CUSTO NÃO LOCALIZADO",
+        "Recomendação": "SEM DADOS PARA RECOMENDAR",
+        "Competência Volume": "Sem competência",
+        "Pendências de Dados": "Sem pendências",
+        "Status Dados": "PENDENTE",
+        "Status Pesquisa": "⏳ Pendente",
+        "Última Pesquisa": "Sem data na fonte",
+    }
+    for _c_v283, _pad_v283 in _texto_padrao_v283.items():
+        if _c_v283 not in out.columns:
+            out[_c_v283] = _pad_v283
+        else:
+            _s_v283 = out[_c_v283].fillna("").astype(str).str.strip()
+            out[_c_v283] = out[_c_v283].where(_s_v283.ne(""), _pad_v283)
+
+    # Explicita as pendências reais por EAN, sem transformar ausência em zero.
+    for _i_v283 in out.index:
+        _pend_v283 = []
+        if not eirox_v285_lab_valido(out.at[_i_v283, "Laboratório"]):
+            _pend_v283.append("LABORATÓRIO")
+        if not eirox_v286_familia_valida(out.at[_i_v283, "Família"]):
+            _pend_v283.append("FAMÍLIA")
+        if pd.isna(pd.to_numeric(pd.Series([out.at[_i_v283, "Preço Atual"]]), errors="coerce").iloc[0]):
+            _pend_v283.append("PREÇO")
+        if pd.isna(pd.to_numeric(pd.Series([out.at[_i_v283, "Custo Unitário"]]), errors="coerce").iloc[0]):
+            _pend_v283.append("CUSTO")
+        if pd.isna(pd.to_numeric(pd.Series([out.at[_i_v283, "Menor Preço Concorrente"]]), errors="coerce").iloc[0]):
+            _pend_v283.append("MERCADO")
+            out.at[_i_v283, "Loja Menor Preço"] = "Sem pesquisa concorrente"
+        if pd.isna(pd.to_numeric(pd.Series([out.at[_i_v283, "Volume Último Mês"]]), errors="coerce").iloc[0]):
+            _pend_v283.append("VOLUME")
+        if _pend_v283:
+            out.at[_i_v283, "Pendências de Dados"] = "; ".join(_pend_v283)
+            out.at[_i_v283, "Status Dados"] = "PENDENTE"
+        elif str(out.at[_i_v283, "Pendências de Dados"]).strip() in {"", "nan", "None"}:
+            out.at[_i_v283, "Pendências de Dados"] = "Sem pendências"
+
+    return out.sort_values(["Prioridade","Ordem"], kind="stable").reset_index(drop=True)
+
+
+
+
+# ==========================================================
+# V8.13 — DATA REAL DIRETO DOS ARQUIVOS VENDA_TESTE
+# ==========================================================
+def eirox_v813_normalizar_loja(valor):
+    txt = "" if pd.isna(valor) else str(valor).strip().casefold()
+    txt = unicodedata.normalize("NFKD", txt)
+    txt = "".join(c for c in txt if not unicodedata.combining(c))
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+
+@st.cache_resource(show_spinner=False, max_entries=8)
+def eirox_v813_ler_venda_teste_raw(assinatura):
+    """
+    Lê DIRETAMENTE os arquivos físicos da pasta VENDA_TESTE.
+    Não usa 'historico' processado, porque algumas etapas podem remover
+    a coluna Data Emissão.
+    """
+    pasta = Path(__file__).resolve().parent / "VENDA_TESTE"
+    frames = []
+
+    try:
+        arquivos = sorted(
+            [
+                p for p in (
+                    list(pasta.glob("*.xlsx"))
+                    + list(pasta.glob("*.xls"))
+                    + list(pasta.glob("*.csv"))
+                )
+                if not p.name.startswith("~$")
+            ],
+            key=lambda p: p.name
+        )
+    except Exception:
+        arquivos = []
+
+    for p in arquivos:
+        try:
+            if p.suffix.lower() == ".csv":
+                try:
+                    df = pd.read_csv(
+                        p, sep=None, engine="python", dtype=str,
+                        encoding="utf-8-sig"
+                    )
+                except Exception:
+                    df = pd.read_csv(
+                        p, sep=None, engine="python", dtype=str,
+                        encoding_errors="ignore"
+                    )
+            else:
+                df = pd.read_excel(
+                    p,
+                    dtype=str
+                )
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df = df.copy()
+                df["__ARQUIVO_V813"] = p.name
+                frames.append(df)
+        except Exception:
+            continue
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True)
+
+
+def eirox_v813_assinatura_venda_teste():
+    pasta = Path(__file__).resolve().parent / "VENDA_TESTE"
+    try:
+        arquivos = [
+            p for p in (
+                list(pasta.glob("*.xlsx"))
+                + list(pasta.glob("*.xls"))
+                + list(pasta.glob("*.csv"))
+            )
+            if not p.name.startswith("~$")
+        ]
+        return tuple(sorted(
+            (p.name, int(p.stat().st_size), int(p.stat().st_mtime_ns))
+            for p in arquivos
+        ))
+    except Exception:
+        return tuple()
+
+
+def eirox_v813_mapa_pesquisas_reais():
+    """
+    Retorna a base atômica de pesquisa:
+    EAN + preço + loja + Data Emissão real + arquivo.
+    """
+    raw = eirox_v813_ler_venda_teste_raw(
+        eirox_v813_assinatura_venda_teste()
+    )
+
+    cols = [
+        "EAN_V813", "Preco_V813", "Loja_V813",
+        "Loja_Norm_V813", "Data_Emissao_V813", "Arquivo_V813"
+    ]
+    if not isinstance(raw, pd.DataFrame) or raw.empty:
+        return pd.DataFrame(columns=cols)
+
+    ce = _prio_coluna(
+        raw,
+        ["EAN (GTIN)", "EAN", "GTIN", "Código de Barras",
+         "Codigo de Barras", "codigobarras"]
+    )
+    cp = _prio_coluna(
+        raw,
+        ["Preço (R$)", "Preco (R$)", "Preço", "Preco"]
+    )
+    cd = _prio_coluna(
+        raw,
+        ["Data Emissão", "Data Emissao"]
+    )
+    cl = _prio_coluna(
+        raw,
+        ["Farmácia", "Farmacia", "Nome Fantasia", "Loja"]
+    )
+
+    if not ce:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.DataFrame(index=raw.index)
+    out["EAN_V813"] = raw[ce].apply(_prio_normalizar_ean)
+    out["Preco_V813"] = (
+        _num(raw[cp]) if cp else np.nan
+    )
+    out["Loja_V813"] = (
+        raw[cl].fillna("").astype(str).str.strip()
+        if cl else ""
+    )
+    out["Loja_Norm_V813"] = out["Loja_V813"].apply(
+        eirox_v813_normalizar_loja
+    )
+    out["Data_Emissao_V813"] = (
+        _dates(raw[cd]) if cd else pd.NaT
+    )
+    out["Arquivo_V813"] = (
+        raw["__ARQUIVO_V813"].fillna("").astype(str)
+        if "__ARQUIVO_V813" in raw.columns else ""
+    )
+
+    out = out[out["EAN_V813"].str.len().gt(0)].copy()
+    return out[cols].reset_index(drop=True)
+
+
+def eirox_v813_data_e_qtd_por_linha(eans, precos, lojas):
+    """
+    Para cada linha da tabela:
+    1) conta todas as ocorrências do EAN na VENDA_TESTE;
+    2) localiza a Data Emissão da ocorrência do menor preço/loja exibidos;
+    3) se preço+loja não casar, tenta EAN+preço;
+    4) se ainda não casar, usa a última Data Emissão válida do EAN.
+    """
+    pesquisas = eirox_v813_mapa_pesquisas_reais()
+
+    qtds = []
+    datas = []
+    fontes = []
+
+    if pesquisas.empty:
+        return (
+            pd.Series([0] * len(eans), index=eans.index, dtype="int64"),
+            pd.Series([""] * len(eans), index=eans.index, dtype="object"),
+            pd.Series([""] * len(eans), index=eans.index, dtype="object"),
+        )
+
+    for idx in eans.index:
+        ean = _prio_normalizar_ean(eans.loc[idx])
+        sub = pesquisas[pesquisas["EAN_V813"].eq(ean)].copy()
+
+        qtds.append(int(len(sub)))
+
+        if sub.empty:
+            datas.append("")
+            fontes.append("")
+            continue
+
+        sub_valid = sub[sub["Data_Emissao_V813"].notna()].copy()
+        if sub_valid.empty:
+            datas.append("")
+            fontes.append("")
+            continue
+
+        preco_alvo = pd.to_numeric(
+            pd.Series([precos.loc[idx]]), errors="coerce"
+        ).iloc[0]
+        loja_alvo = eirox_v813_normalizar_loja(lojas.loc[idx])
+
+        escolhida = pd.DataFrame()
+
+        # Match exato: EAN + preço + loja.
+        if pd.notna(preco_alvo) and float(preco_alvo) > 0:
+            escolhida = sub_valid[
+                (sub_valid["Preco_V813"] - float(preco_alvo)).abs() < 0.005
+            ].copy()
+
+            if loja_alvo and not escolhida.empty:
+                exata_loja = escolhida[
+                    escolhida["Loja_Norm_V813"].eq(loja_alvo)
+                ].copy()
+                if not exata_loja.empty:
+                    escolhida = exata_loja
+
+        # Se não encontrou o preço, tenta a loja.
+        if escolhida.empty and loja_alvo:
+            escolhida = sub_valid[
+                sub_valid["Loja_Norm_V813"].eq(loja_alvo)
+            ].copy()
+
+        # Último fallback: última pesquisa real do EAN.
+        if escolhida.empty:
+            escolhida = sub_valid.copy()
+
+        escolhida = escolhida.sort_values(
+            "Data_Emissao_V813",
+            ascending=False,
+            kind="stable"
+        )
+
+        row = escolhida.iloc[0]
+        dt = row["Data_Emissao_V813"]
+
+        datas.append(
+            dt.strftime("%d/%m/%Y %H:%M:%S")
+            if pd.notna(dt) else ""
+        )
+        fontes.append(str(row.get("Arquivo_V813", "")))
+
+    return (
+        pd.Series(qtds, index=eans.index, dtype="int64"),
+        pd.Series(datas, index=eans.index, dtype="object"),
+        pd.Series(fontes, index=eans.index, dtype="object"),
+    )
+
+
+def eirox_v288_tabela_prioritarios_padrao_subir(prioridades, dados):
+    """
+    Tabela da Prioridade de Pesquisa com EXATAMENTE as mesmas colunas
+    e a mesma ordem da tela SUBIR PREÇO.
+    A população, porém, continua sendo todos os EANs prioritários ativos.
+    """
+    colunas_subir = [
+        "EAN", "Produto", "Laboratório", "Ação", "Flag Preço",
+        "Preço Atual", "Preço Ref. Cálculo", "Preço Mercado",
+        "Menor Preço Concorrente", "Loja do Menor Preço", "Data da Pesquisa", "Qtd. Pesquisas",
+        "Preço Sugerido", "Aumento Unitário", "Diferença %",
+        "Qtd Vendida", "Ganho de Lucro Potencial",
+        "Preço Usado no Ganho", "Custo Unitário", "Margem Atual",
+    ]
+
+    if not isinstance(prioridades, pd.DataFrame) or prioridades.empty:
+        return pd.DataFrame(columns=colunas_subir)
+    if not isinstance(dados, pd.DataFrame) or dados.empty:
+        return pd.DataFrame(columns=colunas_subir)
+
+    p = prioridades.copy()
+    p["EAN"] = p["EAN"].apply(_prio_normalizar_ean)
+    eans_prioritarios = set(p.loc[p["EAN"].str.len().gt(0), "EAN"])
+    if not eans_prioritarios:
+        return pd.DataFrame(columns=colunas_subir)
+
+    try:
+        base_enriquecida = eirox_enriquecer_menor_preco_concorrente(
+            dados.copy(),
+            globals().get("historico", pd.DataFrame())
+        )
+    except Exception:
+        base_enriquecida = dados.copy()
+
+    try:
+        motor = eirox_motor_oportunidades(base_enriquecida)
+    except Exception:
+        motor = pd.DataFrame()
+
+    if not isinstance(motor, pd.DataFrame) or motor.empty:
+        return pd.DataFrame(columns=colunas_subir)
+
+    c_ean = _eirox_first_col(motor, ["EAN", "EAN (GTIN)", "GTIN"])
+    if not c_ean:
+        return pd.DataFrame(columns=colunas_subir)
+
+    m = motor.copy()
+    m["__EAN_V288"] = _ean(m[c_ean])
+    m = m[m["__EAN_V288"].isin(eans_prioritarios)].copy()
+    if m.empty:
+        return pd.DataFrame(columns=colunas_subir)
+
+    # Volume fechado por EAN, igual à tela SUBIR PREÇO.
+    try:
+        fechado = eirox_v158_ultimo_mes_fechado_memoria(
+            globals().get("venda_rede", pd.DataFrame())
+        )
+    except Exception:
+        fechado = pd.DataFrame()
+
+    if isinstance(fechado, pd.DataFrame) and not fechado.empty and "EAN" in fechado.columns:
+        f = fechado.copy()
+        f["__EAN_V288"] = _ean(f["EAN"])
+        f = f.drop_duplicates("__EAN_V288", keep="last")
+        lkq = f.set_index("__EAN_V288")["Itens_Mes_Fechado"]
+        m["__QTD_V288"] = m["__EAN_V288"].map(lkq)
+    else:
+        m["__QTD_V288"] = np.nan
+
+    c_prod = _eirox_first_col(m, ["Produto", "Descrição", "Descricao", "Produto na Pesquisa"])
+    c_lab = _eirox_first_col(m, ["Laboratório", "Laboratorio", "Fabricante"])
+
+    out = pd.DataFrame(index=m.index)
+    out["EAN"] = m["__EAN_V288"]
+    out["Produto"] = m[c_prod].astype(str) if c_prod else ""
+
+    # Laboratório completo pela mesma hierarquia cadastral da Fase 8.5.
+    out["Laboratório"] = m[c_lab].astype(str) if c_lab else ""
+    try:
+        _cad = pd.DataFrame({"EAN": out["EAN"], "Produto": out["Produto"], "Laboratório": out["Laboratório"]})
+        _cad = eirox_v285_enriquecer_laboratorio_prioritarios(_cad, dados)
+        out["Laboratório"] = _cad["Laboratório"].to_numpy()
+    except Exception:
+        pass
+
+    out["Ação"] = m.get(
+        "Recomendacao_Central",
+        pd.Series("", index=m.index)
+    ).fillna("").astype(str)
+
+    _acao_flag = out["Ação"].fillna("").astype(str).str.upper()
+    _preco_sug_flag = pd.to_numeric(
+        m.get("Preço_Sugerido_Eirox", np.nan),
+        errors="coerce"
+    )
+    out["Flag Preço"] = np.select(
+        [
+            _preco_sug_flag.isna() | (_preco_sug_flag <= 0),
+            _acao_flag.eq("NEGOCIAR COMPRA"),
+            _acao_flag.eq("SUBIR PREÇO"),
+            _acao_flag.eq("BAIXAR PREÇO"),
+            _acao_flag.eq("MANTER"),
+        ],
+        [
+            "⛔ SEM BASE PARA CALCULAR",
+            "⚠️ CUSTO BLOQUEIA PREÇO",
+            "🚩 PREÇO CALCULADO",
+            "🚩 PREÇO CALCULADO",
+            "✅ MANTER PREÇO",
+        ],
+        default="ℹ️ REVISAR"
+    )
+
+    pa = pd.to_numeric(m.get("Preço_Atual_Eirox", np.nan), errors="coerce")
+    pref = pd.to_numeric(m.get("Preço_Base_Calculo_Eirox", np.nan), errors="coerce")
+    pm = pd.to_numeric(m.get("Preço_Mercado_Eirox", np.nan), errors="coerce")
+    ps = pd.to_numeric(m.get("Preço_Sugerido_Eirox", np.nan), errors="coerce")
+    cu = pd.to_numeric(m.get("Custo_Unitario_Eirox", np.nan), errors="coerce")
+    qtd = pd.to_numeric(m["__QTD_V288"], errors="coerce").fillna(0)
+
+    out["Preço Atual"] = pa.apply(
+        lambda x: _eirox_moeda_num(x) if pd.notna(x) and x > 0 else ""
+    )
+    out["Preço Ref. Cálculo"] = pref.apply(
+        lambda x: _eirox_moeda_num(x) if pd.notna(x) and x > 0 else ""
+    )
+    out["Preço Mercado"] = pm.apply(
+        lambda x: _eirox_moeda_num(x) if pd.notna(x) and x > 0 else ""
+    )
+
+    if "Menor Preço Concorrente" in m.columns:
+        out["Menor Preço Concorrente"] = pd.to_numeric(
+            m["Menor Preço Concorrente"], errors="coerce"
+        ).apply(lambda x: _eirox_moeda_num(x) if pd.notna(x) and x > 0 else "")
+    else:
+        out["Menor Preço Concorrente"] = ""
+
+    out["Loja do Menor Preço"] = (
+        m.get("Loja do Menor Preço", pd.Series("", index=m.index))
+        .fillna("").astype(str)
+    )
+    out["Data da Pesquisa"] = (
+        m.get("Data da Pesquisa", pd.Series("", index=m.index))
+        .fillna("").astype(str)
+    )
+
+    # V8.13 — Data Emissão REAL lida diretamente dos arquivos da pasta VENDA_TESTE.
+    # Não depende da variável 'historico' processada.
+    _preco_pesquisa_v813 = pd.to_numeric(
+        m.get("Menor Preço Concorrente", pd.Series(np.nan, index=m.index)),
+        errors="coerce"
+    )
+    _loja_pesquisa_v813 = (
+        m.get("Loja do Menor Preço", pd.Series("", index=m.index))
+        .fillna("").astype(str)
+    )
+
+    _qtd_real_v813, _data_real_v813, _arquivo_real_v813 = (
+        eirox_v813_data_e_qtd_por_linha(
+            m["__EAN_V288"],
+            _preco_pesquisa_v813,
+            _loja_pesquisa_v813,
+        )
+    )
+
+    out["Qtd. Pesquisas"] = _qtd_real_v813.to_numpy()
+    out["Data da Pesquisa"] = _data_real_v813.to_numpy()
+
+    out["Preço Sugerido"] = ps.apply(
+        lambda x: _eirox_moeda_num(x) if pd.notna(x) and x > 0 else ""
+    )
+
+    aumento = (ps - pa)
+    out["Aumento Unitário"] = aumento.apply(
+        lambda x: _eirox_moeda_num(x) if pd.notna(x) else ""
+    )
+    diferenca = np.where(pa.gt(0), (ps - pa) / pa, np.nan)
+    out["Diferença %"] = pd.Series(diferenca, index=m.index).apply(
+        lambda x: _eirox_pct_num(x) if pd.notna(x) else ""
+    )
+
+    out["Qtd Vendida"] = qtd.round(0).astype(int)
+
+    ganho_pot = (ps - pa).clip(lower=0).fillna(0) * qtd
+    out["Ganho de Lucro Potencial"] = ganho_pot.apply(_eirox_moeda_num)
+
+    out["Preço Usado no Ganho"] = pa.apply(
+        lambda x: _eirox_moeda_num(x) if pd.notna(x) and x > 0 else ""
+    )
+    out["Custo Unitário"] = cu.apply(
+        lambda x: _eirox_moeda_num(x) if pd.notna(x) and x > 0 else ""
+    )
+
+    margem = np.where(pa.gt(0), (pa - cu) / pa, np.nan)
+    out["Margem Atual"] = pd.Series(margem, index=m.index).apply(
+        lambda x: _eirox_pct_num(x) if pd.notna(x) else ""
+    )
+
+    # Barreira final V7.1 também nesta tabela.
+    out = eirox_v271_aplicar_preco_canonico_tabela(out)
+
+    # A barreira V7.1 acrescenta colunas de auditoria; nesta tela elas são
+    # removidas para manter EXATAMENTE o mesmo desenho de SUBIR PREÇO.
+    for c in list(out.columns):
+        if c not in colunas_subir:
+            out = out.drop(columns=[c])
+
+    # Reordenação final determinística.
+    for c in colunas_subir:
+        if c not in out.columns:
+            out[c] = ""
+    return out[colunas_subir].reset_index(drop=True)
+
+
+def eirox_v288_render_analise_prioritarios(prioridades, dados):
+    """Render idêntico à lista da tela SUBIR PREÇO, inclusive colunas e exportações."""
+    eirox_core_css()
+
+    tab = eirox_v288_tabela_prioritarios_padrao_subir(prioridades, dados)
+
+    # V8.9 — cards de resumo no mesmo padrão visual da tela SUBIR PREÇO.
+    if isinstance(tab, pd.DataFrame) and not tab.empty:
+        def _v289_num_money(serie):
+            try:
+                return pd.to_numeric(
+                    serie.astype(str)
+                    .str.replace("R$", "", regex=False)
+                    .str.replace(".", "", regex=False)
+                    .str.replace(",", ".", regex=False)
+                    .str.strip(),
+                    errors="coerce"
+                )
+            except Exception:
+                return pd.Series(dtype="float64")
+
+        def _v289_num_pct(serie):
+            try:
+                return pd.to_numeric(
+                    serie.astype(str)
+                    .str.replace("%", "", regex=False)
+                    .str.replace(".", "", regex=False)
+                    .str.replace(",", ".", regex=False)
+                    .str.strip(),
+                    errors="coerce"
+                )
+            except Exception:
+                return pd.Series(dtype="float64")
+
+        _qtd_v289 = int(len(tab))
+
+        _ganho_v289 = 0.0
+        if "Ganho de Lucro Potencial" in tab.columns:
+            _s_ganho_v289 = _v289_num_money(tab["Ganho de Lucro Potencial"])
+            _ganho_v289 = float(_s_ganho_v289.fillna(0).sum()) if not _s_ganho_v289.empty else 0.0
+
+        _dif_media_v289 = np.nan
+        if "Diferença %" in tab.columns:
+            _s_dif_v289 = _v289_num_pct(tab["Diferença %"]).dropna()
+            if not _s_dif_v289.empty:
+                _dif_media_v289 = float(_s_dif_v289.mean()) / 100.0
+
+        _margem_media_v289 = np.nan
+        if "Margem Atual" in tab.columns:
+            _s_margem_v289 = _v289_num_pct(tab["Margem Atual"]).dropna()
+            if not _s_margem_v289.empty:
+                _margem_media_v289 = float(_s_margem_v289.mean()) / 100.0
+
+        _c1_v289, _c2_v289, _c3_v289, _c4_v289 = st.columns(4)
+        _c1_v289.markdown(
+            eirox_core_card_html(
+                "Produtos prioritários",
+                f"{_qtd_v289:,}".replace(",", "."),
+                "",
+                "green"
+            ),
+            unsafe_allow_html=True
+        )
+        _c2_v289.markdown(
+            eirox_core_card_html(
+                "Ganho de lucro potencial",
+                _eirox_moeda_num(_ganho_v289),
+                "",
+                "green"
+            ),
+            unsafe_allow_html=True
+        )
+        _c3_v289.markdown(
+            eirox_core_card_html(
+                "Diferença média",
+                _eirox_pct_num(_dif_media_v289) if pd.notna(_dif_media_v289) else "-",
+                "",
+                "green"
+            ),
+            unsafe_allow_html=True
+        )
+        _c4_v289.markdown(
+            eirox_core_card_html(
+                "Margem atual média",
+                _eirox_pct_num(_margem_media_v289) if pd.notna(_margem_media_v289) else "-",
+                "",
+                "green"
+            ),
+            unsafe_allow_html=True
+        )
+
+        # Segunda linha: distribuição das ações dos itens prioritários.
+        _acao_v289 = tab.get("Ação", pd.Series("", index=tab.index)).fillna("").astype(str).str.upper()
+        _subir_v289 = int(_acao_v289.eq("SUBIR PREÇO").sum())
+        _baixar_v289 = int(_acao_v289.eq("BAIXAR PREÇO").sum())
+        _negociar_v289 = int(_acao_v289.eq("NEGOCIAR COMPRA").sum())
+        _manter_v289 = int(_acao_v289.eq("MANTER").sum())
+
+        _a1_v289, _a2_v289, _a3_v289, _a4_v289 = st.columns(4)
+        _a1_v289.markdown(
+            eirox_core_card_html("Subir Preço", f"{_subir_v289:,}".replace(",", "."), "", "green"),
+            unsafe_allow_html=True
+        )
+        _a2_v289.markdown(
+            eirox_core_card_html("Baixar Preço", f"{_baixar_v289:,}".replace(",", "."), "", "red"),
+            unsafe_allow_html=True
+        )
+        _a3_v289.markdown(
+            eirox_core_card_html("Negociar Compra", f"{_negociar_v289:,}".replace(",", "."), "", "yellow"),
+            unsafe_allow_html=True
+        )
+        _a4_v289.markdown(
+            eirox_core_card_html("Manter", f"{_manter_v289:,}".replace(",", "."), "", "green"),
+            unsafe_allow_html=True
+        )
+
+    st.markdown("<div class='priority-title'>Lista priorizada</div>", unsafe_allow_html=True)
+    st.caption(
+        f"Exibindo todos os {len(tab):,} produtos cadastrados na Prioridade de Pesquisa."
+        .replace(",", ".")
+    )
+
+    if tab.empty:
+        st.info("Nenhum produto prioritário disponível para análise.")
+        return
+
+    eirox_dataframe_brl(
+        eirox_estilizar_tabela_core(tab),
+        use_container_width=True,
+        hide_index=True,
+        height=560
+    )
+
+    if globals().get("pode_exportar", True):
+        st.download_button(
+            "📥 Exportar lista",
+            tab.to_csv(index=False, sep=";").encode("utf-8-sig"),
+            "prioridade_pesquisa.csv",
+            "text/csv",
+            use_container_width=True,
+            key="export_core_prioridade_v288"
+        )
+        eirox_botao_excel_padrao(
+            tab,
+            "Lista de Pricing",
+            "lista_pricing_prioridade.xlsx",
+            key="excel_core_prioridade_v288",
+            use_container_width=True
+        )
+
+
+def eirox_v282_render_analise_prioritarios(prioridades, dados):
+    # V8.8 — espelho exato da tela SUBIR PREÇO: mesmo padrão e mesmas colunas.
+    return eirox_v288_render_analise_prioritarios(prioridades, dados)
+
+
+def eirox_render_prioridade_pesquisa(dados_contexto):
+    st.markdown("""
+    <div class="eirox-hero">
+      <div class="eirox-section-title">Operação de Pesquisa</div>
+      <h1>🎯 Prioridade de Pesquisa</h1>
+      <p>Cadastre os produtos mais importantes da venda e acompanhe quais já possuem pesquisa na base atual.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    st.caption("ⓘ A fila é ordenada por prioridade. Itens pendentes devem ser pesquisados primeiro e podem ser exportados para a equipe de campo.")
+
+    base_toda, base_emp = _prio_base_empresa()
+    ativos = base_emp[base_emp["Ativo"] == True].copy()
+    fila = _prio_resumo_pesquisa(ativos, dados_contexto)
+
+    total = len(ativos)
+    pesquisados = int((fila.get("Status Pesquisa", pd.Series(dtype=str)) == "✅ Pesquisado").sum()) if total else 0
+    pendentes = max(total - pesquisados, 0)
+    cobertura = (pesquisados / total * 100.0) if total else 0.0
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Produtos prioritários", f"{total:,}".replace(",", "."))
+    c2.metric("Já pesquisados", f"{pesquisados:,}".replace(",", "."))
+    c3.metric("Pendentes", f"{pendentes:,}".replace(",", "."))
+    c4.metric("Cobertura", f"{cobertura:.1f}%".replace(".", ","))
+
+    tab1, tab2, tab3 = st.tabs(["📋 Fila de Pesquisa", "➕ Cadastrar / Importar", "⚙️ Manutenção"])
+
+    with tab1:
+        f1,f2 = st.columns([2,1])
+        busca = f1.text_input("Buscar por EAN ou produto", key="prio_busca")
+        status = f2.selectbox("Status", ["Todos", "⏳ Pendente", "✅ Pesquisado"], key="prio_status")
+        vis = fila.copy()
+        if busca:
+            termo = str(busca).strip()
+            vis = vis[vis["EAN"].astype(str).str.contains(termo, case=False, na=False) | vis["Produto"].astype(str).str.contains(termo, case=False, na=False)]
+        if status != "Todos":
+            vis = vis[vis["Status Pesquisa"] == status]
+        cols = [c for c in ["Ordem", "Prioridade", "EAN", "Produto", "Status Pesquisa", "Qtd. Registros", "Data mais recente", "Média Venda/Mês (Unid.)", "Média Venda/Mês (R$)"] if c in vis.columns]
+        # V8.19 — esta tabela precisa manter a coluna de unidades como numeral.
+        # O app possui um interceptor global de st.dataframe que transforma colunas
+        # com "Venda" em moeda. Aqui chamamos o dataframe ORIGINAL para respeitar
+        # o NumberColumn("%d") e impedir "R$" em Média Venda/Mês (Unid.).
+        _vis_tela_v819 = vis[cols].copy()
+        if "Média Venda/Mês (Unid.)" in _vis_tela_v819.columns:
+            _vis_tela_v819["Média Venda/Mês (Unid.)"] = pd.to_numeric(
+                _vis_tela_v819["Média Venda/Mês (Unid.)"], errors="coerce"
+            ).round(0).astype("Int64")
+
+        _dataframe_original_v819 = getattr(
+            st, "_eirox_dataframe_original", st.dataframe
+        )
+        _dataframe_original_v819(
+            _vis_tela_v819,
+            use_container_width=True,
+            hide_index=True,
+            height=520,
+            column_config={
+                "Média Venda/Mês (Unid.)": st.column_config.NumberColumn(
+                    "Média Venda/Mês (Unid.)", format="%d"
+                ),
+                "Média Venda/Mês (R$)": st.column_config.NumberColumn(
+                    "Média Venda/Mês (R$)", format="R$ %.2f"
+                )
+            }
+        )
+        export = vis[cols].copy().to_csv(index=False, sep=";", encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button("⬇️ Exportar fila de pesquisa", export, file_name="prioridade_pesquisa.csv", mime="text/csv", use_container_width=True)
+
+    with tab2:
+        st.subheader("Lançar produto prioritário")
+        with st.form("form_prio_add", clear_on_submit=True):
+            a,b = st.columns([1,2])
+            ean = a.text_input("EAN / Código de barras")
+            produto = b.text_input("Produto / Embalagem")
+            c,d = st.columns([1,2])
+            prioridade = c.selectbox("Prioridade", ["1 - Crítica", "2 - Alta", "3 - Normal"])
+            obs = d.text_input("Observação")
+            incluir = st.form_submit_button("➕ Adicionar à fila", use_container_width=True)
+        if incluir:
+            ean_n = _prio_normalizar_ean(ean)
+            if not ean_n:
+                st.error("Informe um EAN válido.")
+            elif not str(produto).strip():
+                st.error("Informe o produto.")
+            else:
+                emp = _prio_empresa_id()
+                todos = _prio_carregar()
+                mask = (todos["EmpresaID"].astype(str)==emp) & (todos["EAN"].astype(str)==ean_n)
+                ordem_max = pd.to_numeric(todos.loc[todos["EmpresaID"].astype(str)==emp, "Ordem"], errors="coerce").max()
+                nova_ordem = 1 if pd.isna(ordem_max) else int(ordem_max)+1
+                row = {"EmpresaID":emp,"Ordem":nova_ordem,"EAN":ean_n,"Produto":str(produto).strip(),"Prioridade":prioridade,"Ativo":True,"Origem":"Manual","Observacao":str(obs).strip(),"AtualizadoEm":datetime.now().strftime("%d/%m/%Y %H:%M")}
+                if mask.any():
+                    for k,v in row.items(): todos.loc[mask,k]=v
+                else:
+                    todos = pd.concat([todos, pd.DataFrame([row])], ignore_index=True)
+                ok,erro = _prio_salvar(todos)
+                st.success("Produto incluído/atualizado na fila." if ok else "Produto mantido nesta sessão; não foi possível persistir no arquivo.")
+                st.rerun()
+
+        st.divider()
+        st.subheader("Importar lista")
+        st.caption("Aceita CSV ou Excel. O arquivo deve ter uma coluna de EAN/código de barras e, preferencialmente, uma coluna Produto/Embalagem.")
+        up = st.file_uploader("Arquivo", type=["csv","xlsx","xls"], key="prio_import")
+        if up is not None:
+            try:
+                if str(up.name).lower().endswith(".csv"):
+                    imp = pd.read_csv(up, sep=None, engine="python", dtype=str)
+                else:
+                    imp = pd.read_excel(up, dtype=str)
+                ce = _prio_coluna(imp, ["EAN","EAN (GTIN)","GTIN","Código de Barras","Codigo de Barras","Cód. Barras/Etiq.","Cod Barras"])
+                cp = _prio_coluna(imp, ["Produto","Embalagem","Descrição","Descricao","Nome"])
+                if not ce:
+                    st.error("Não encontrei a coluna de EAN/código de barras.")
+                else:
+                    prev = pd.DataFrame({"EAN": imp[ce].apply(_prio_normalizar_ean), "Produto": imp[cp].astype(str) if cp else ""})
+                    prev = prev[prev["EAN"].str.len().gt(0)].drop_duplicates("EAN")
+                    st.dataframe(prev.head(30), use_container_width=True, hide_index=True)
+                    if st.button("📥 Importar para prioridade", use_container_width=True):
+                        emp = _prio_empresa_id(); todos = _prio_carregar()
+                        ordem_max = pd.to_numeric(todos.loc[todos["EmpresaID"].astype(str)==emp, "Ordem"], errors="coerce").max()
+                        ordem = 0 if pd.isna(ordem_max) else int(ordem_max)
+                        for _,r in prev.iterrows():
+                            e = r["EAN"]; prod = str(r["Produto"] or "").strip()
+                            mask=(todos["EmpresaID"].astype(str)==emp)&(todos["EAN"].astype(str)==e)
+                            if mask.any():
+                                if prod: todos.loc[mask,"Produto"] = prod
+                                todos.loc[mask,"Ativo"] = True
+                            else:
+                                ordem += 1
+                                nr={"EmpresaID":emp,"Ordem":ordem,"EAN":e,"Produto":prod,"Prioridade":"1 - Crítica","Ativo":True,"Origem":"Importação","Observacao":"","AtualizadoEm":datetime.now().strftime("%d/%m/%Y %H:%M")}
+                                todos=pd.concat([todos,pd.DataFrame([nr])],ignore_index=True)
+                        _prio_salvar(todos)
+                        st.success(f"{len(prev)} itens processados.")
+                        st.rerun()
+            except Exception as exc:
+                st.error(f"Não foi possível ler o arquivo: {exc}")
+
+    with tab3:
+        st.subheader("Manutenção da lista")
+        emp = _prio_empresa_id()
+        manut = base_emp[["Ordem","EAN","Produto","Prioridade","Ativo","Observacao"]].copy()
+        manut["Excluir"] = False
+        edit = st.data_editor(
+            manut,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "Prioridade": st.column_config.SelectboxColumn("Prioridade", options=["1 - Crítica","2 - Alta","3 - Normal"]),
+                "Ativo": st.column_config.CheckboxColumn("Ativo"),
+                "Excluir": st.column_config.CheckboxColumn("Excluir"),
+            },
+            key="prio_editor"
+        )
+        if st.button("💾 Salvar alterações", use_container_width=True):
+            todos = _prio_carregar()
+            outros = todos[todos["EmpresaID"].astype(str)!=emp].copy()
+            edit = edit[edit["Excluir"] != True].copy().drop(columns=["Excluir"], errors="ignore")
+            edit["EmpresaID"] = emp
+            edit["Origem"] = "Cadastro"
+            edit["AtualizadoEm"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+            edit["EAN"] = edit["EAN"].apply(_prio_normalizar_ean)
+            final = pd.concat([outros, edit], ignore_index=True)
+            ok,erro = _prio_salvar(final)
+            if ok:
+                st.success("Lista atualizada.")
+                st.rerun()
+            else:
+                st.error(f"Não foi possível persistir as alterações: {erro}")
+
+    # Fase 8.2 — análise completa fica abaixo da operação da Prioridade de Pesquisa.
+    eirox_v282_render_analise_prioritarios(ativos, dados_contexto)
+
+
 paginas_liberadas = PERMISSOES_TELAS.get(
     perfil_usuario,
     [
@@ -15859,6 +20312,10 @@ if usuario_pode_ver_billing_enterprise() and "💳 Billing Enterprise" not in pa
 
 paginas_liberadas = filtrar_paginas_por_plano(paginas_liberadas)
 
+# V1.4.36 — tela operacional de prioridade disponível aos perfis de negócio.
+if perfil_usuario in {"Master", "Diretoria", "Pricing", "Comercial", "Regional"} and "🎯 Prioridade de Pesquisa" not in paginas_liberadas:
+    paginas_liberadas = paginas_liberadas + ["🎯 Prioridade de Pesquisa"]
+
 # Evita qualquer tela duplicada no menu, preservando a ordem original.
 paginas_liberadas = list(dict.fromkeys(paginas_liberadas))
 # EIROX_V45_REMOVE_REDE_LOJA
@@ -15869,7 +20326,7 @@ paginas_liberadas = [p for p in paginas_liberadas if p != "📋 Workflow Comerci
 
 # EIROX_NUCLEO_CANONICO_MENU
 # Mantém a sequência operacional principal padronizada.
-_ordem_core = ["📊 Geral", "⬆️ Subir Preço", "⬇️ Baixar Preço", "🤝 Negociar Compra"]
+_ordem_core = ["🎯 Prioridade de Pesquisa", "📊 Geral", "⬆️ Subir Preço", "⬇️ Baixar Preço", "🤝 Negociar Compra"]
 _existentes_core = [p for p in _ordem_core if p in paginas_liberadas]
 _restantes_core = [p for p in paginas_liberadas if p not in _ordem_core]
 
@@ -15906,7 +20363,7 @@ else:
 
 
 # Núcleo comercial - mesma ordem da proposta visual.
-_core_pages_eirox = ["📊 Geral", "⬆️ Subir Preço", "⬇️ Baixar Preço", "🤝 Negociar Compra"]
+_core_pages_eirox = ["🎯 Prioridade de Pesquisa", "📊 Geral", "⬆️ Subir Preço", "⬇️ Baixar Preço", "🤝 Negociar Compra", "📋 Plano de Ações", "💰 Resultado Realizado"]
 if "📊 Dashboard Geral" in paginas_liberadas:
     _idx_dashboard = paginas_liberadas.index("📊 Dashboard Geral") + 1
     for _pg in reversed(_core_pages_eirox):
@@ -15914,6 +20371,18 @@ if "📊 Dashboard Geral" in paginas_liberadas:
             paginas_liberadas.remove(_pg)
         paginas_liberadas.insert(_idx_dashboard, _pg)
 
+
+
+# Fase 4 — Central de Qualidade: ferramenta administrativa.
+if "🧪 Central de Qualidade" not in paginas_liberadas:
+    paginas_liberadas.append("🧪 Central de Qualidade")
+
+# Fase 5 — Plano de Ações faz parte da Área do Cliente.
+if "📋 Plano de Ações" not in paginas_liberadas:
+    paginas_liberadas.append("📋 Plano de Ações")
+ 
+if "💰 Resultado Realizado" not in paginas_liberadas:
+    paginas_liberadas.append("💰 Resultado Realizado")
 
 paginas_cliente_menu, paginas_admin_menu = dividir_menu_cliente_admin(paginas_liberadas)
 
@@ -15934,6 +20403,76 @@ if pagina is None:
 
 if pagina not in paginas_liberadas:
     pagina = paginas_liberadas[0]
+
+
+# Fase 1 — status da base pronta. Lê somente metadata JSON.
+try:
+    if usuario_master():
+        _meta_v200 = eirox_v200_ler_metadata(_eirox_sig_master)
+        with st.sidebar.expander("⚙️ Base Analítica 2.0", expanded=False):
+            if _meta_v200:
+                st.caption(f"Última geração: {_meta_v200.get('gerado_em', '—')}")
+                st.caption(f"Produtos/linhas: {_meta_v200.get('linhas', 0):,}".replace(",", "."))
+                st.caption(f"Formato: {_meta_v200.get('formato', '—')}")
+                st.success("Base analítica pronta")
+            else:
+                st.caption("A base será criada automaticamente na próxima preparação válida.")
+
+            if st.button(
+                "🔄 Reconstruir base analítica",
+                key="eirox_v200_reconstruir_base",
+                use_container_width=True,
+            ):
+                st.session_state["eirox_v200_forcar_rebuild"] = True
+                try:
+                    eirox_processar_base_master_cacheada.clear()
+                except Exception:
+                    pass
+                try:
+                    eirox_v200_carregar_base_analitica.clear()
+                except Exception:
+                    pass
+                st.rerun()
+except Exception:
+    pass
+
+
+# Fase 2 — diagnóstico enxuto da verdade oficial.
+try:
+    if usuario_master() and isinstance(df, pd.DataFrame) and not df.empty:
+        with st.sidebar.expander("🧭 Camada Oficial de Dados", expanded=False):
+            _tot_v210 = int(len(df))
+            _completo_v210 = int(
+                df.get(
+                    "Status_Dado_Oficial",
+                    pd.Series("", index=df.index)
+                ).astype(str).eq("COMPLETO").sum()
+            )
+            _pct_v210 = (
+                (_completo_v210 / _tot_v210 * 100)
+                if _tot_v210 else 0
+            )
+            st.caption("Preço: VENDA_TESTE → último mês fechado")
+            st.caption("Custo: ESTOQUE_TESTE → VENDA_FINAL_TESTE")
+            st.caption("Mercado: menor concorrente + mesma loja/data")
+            st.caption("Volume: último mês fechado por EAN")
+            st.metric("Cobertura completa", f"{_pct_v210:.1f}%".replace(".", ","))
+            st.caption(f"{_completo_v210:,} de {_tot_v210:,} registros completos".replace(",", "."))
+except Exception:
+    pass
+
+# Fase 8 — status do núcleo compartilhado e perfil ativo.
+try:
+    if usuario_master():
+        with st.sidebar.expander("🧩 Núcleo Multi-Cliente", expanded=False):
+            _manifest_v280 = eirox_v280_core_manifest()
+            st.caption(f"Núcleo: {_manifest_v280['Núcleo']}")
+            st.caption(f"Ruleset: {_manifest_v280['Ruleset']}")
+            st.caption(f"Cliente ativo: {_manifest_v280['Cliente']}")
+            st.caption(f"Produto: {_manifest_v280['Produto']}")
+            st.success("Regras financeiras compartilhadas")
+except Exception:
+    pass
 
 registrar_pagina_acessada(pagina)
 
@@ -15963,40 +20502,77 @@ if not pode_ver_margin:
         "🔒 Margem e custo restritos para este perfil."
     )
 
+# Fase 7 — telas de workflow não precisam executar o pipeline competitivo,
+# filtros por município, menor preço e enriquecimentos da navegação comercial.
+if pagina == "💰 Resultado Realizado":
+    eirox_v260_render(df)
+    st.stop()
+
+if pagina == "📋 Plano de Ações":
+    eirox_v250_render_plano_acoes(df)
+    st.stop()
+
+if pagina == "🧪 Central de Qualidade":
+    if not usuario_master():
+        st.error("Acesso restrito à administração.")
+        st.stop()
+    eirox_v240_render_central_qualidade(df)
+    st.stop()
+
 st.sidebar.markdown(
     '<div class="sidebar-section">Filtros Globais</div>',
     unsafe_allow_html=True
 )
 
+_lab_opts_v270 = sorted(df["Laboratório"].dropna().unique()) if "Laboratório" in df.columns else []
+_fam_opts_v270 = sorted(df["Família"].dropna().unique()) if "Família" in df.columns else []
+_curva_opts_v270 = sorted(df["CURVA"].dropna().unique()) if "CURVA" in df.columns else []
+
+# Remove valores antigos que não existem no contexto atual.
+for _k_v270, _opts_v270 in [
+    ("eirox_v270_filtro_lab", _lab_opts_v270),
+    ("eirox_v270_filtro_familia", _fam_opts_v270),
+    ("eirox_v270_filtro_curva", _curva_opts_v270),
+]:
+    if _k_v270 in st.session_state:
+        _validos_v270 = set(map(str, _opts_v270))
+        st.session_state[_k_v270] = [
+            x for x in st.session_state.get(_k_v270, [])
+            if str(x) in _validos_v270
+        ]
+
+if st.sidebar.button(
+    "🧹 Limpar filtros",
+    key="eirox_v270_limpar_filtros",
+    use_container_width=True,
+):
+    st.session_state["eirox_v270_filtro_lab"] = []
+    st.session_state["eirox_v270_filtro_familia"] = []
+    st.session_state["eirox_v270_filtro_curva"] = []
+    st.session_state["eirox_v270_filtro_busca"] = ""
+    st.rerun()
+
 laboratorio = st.sidebar.multiselect(
     "Laboratório",
-    sorted(
-        df["Laboratório"]
-        .dropna()
-        .unique()
-    )
+    _lab_opts_v270,
+    key="eirox_v270_filtro_lab",
 )
 
 familia = st.sidebar.multiselect(
     "Família",
-    sorted(
-        df["Família"]
-        .dropna()
-        .unique()
-    )
+    _fam_opts_v270,
+    key="eirox_v270_filtro_familia",
 )
 
 curva = st.sidebar.multiselect(
     "Curva",
-    sorted(
-        df["CURVA"]
-        .dropna()
-        .unique()
-    )
+    _curva_opts_v270,
+    key="eirox_v270_filtro_curva",
 )
 
 busca = st.sidebar.text_input(
-    "Produto ou EAN"
+    "Produto ou EAN",
+    key="eirox_v270_filtro_busca",
 )
 
 # --------------------------------------------------
@@ -16044,53 +20620,29 @@ df_filtrado = eirox_pipeline_municipio_cacheado(
     _compra_contexto_municipio,
     _estoque_contexto_municipio,
     _venda_contexto_municipio,
-)
+).copy(deep=True)
 
 eirox_render_alertas_premium(df_filtrado)
 
-if laboratorio:
+_eirox_chave_filtro_leve_v270 = hashlib.sha256(
+    repr((
+        st.session_state.get("eirox_municipio_global", "Todos"),
+        tuple(sorted(map(str, laboratorio))) if laboratorio else (),
+        tuple(sorted(map(str, familia))) if familia else (),
+        tuple(sorted(map(str, curva))) if curva else (),
+        str(busca or ""),
+    )).encode("utf-8")
+).hexdigest()
 
-    df_filtrado = df_filtrado[
-        df_filtrado["Laboratório"]
-        .isin(laboratorio)
-    ]
-
-if familia:
-
-    df_filtrado = df_filtrado[
-        df_filtrado["Família"]
-        .isin(familia)
-    ]
-
-if curva:
-
-    df_filtrado = df_filtrado[
-        df_filtrado["CURVA"]
-        .isin(curva)
-    ]
-
-if busca:
-
-    df_filtrado = df_filtrado[
-        (
-            df_filtrado["Produto"]
-            .astype(str)
-            .str.contains(
-                busca,
-                case=False,
-                na=False
-            )
-        )
-        |
-        (
-            df_filtrado["EAN"]
-            .astype(str)
-            .str.contains(
-                busca,
-                na=False
-            )
-        )
-    ]
+df_filtrado = eirox_v270_filtrar_base_cacheada(
+    _eirox_sig_master,
+    _eirox_chave_filtro_leve_v270,
+    df_filtrado,
+    tuple(laboratorio or ()),
+    tuple(familia or ()),
+    tuple(curva or ()),
+    str(busca or ""),
+).copy()
 
 
 
@@ -16115,7 +20667,7 @@ df_filtrado = eirox_menor_preco_cacheado(
     _eirox_sig_contexto,
     df_filtrado,
     historico if "historico" in globals() else None,
-)
+).copy(deep=True)
 
 
 # --------------------------------------------------
@@ -16263,7 +20815,7 @@ def eirox_v1413_enriquecer_venda_compra(base, simulacao_ref=None, compra_ref=Non
             return base
 
 
-@st.cache_data(show_spinner=False, max_entries=32)
+@st.cache_resource(show_spinner=False, max_entries=48)
 def eirox_v1430_enriquecer_venda_compra_cacheado(
     chave_filtros,
     assinatura_master,
@@ -16280,16 +20832,19 @@ def eirox_v1430_enriquecer_venda_compra_cacheado(
     )
 
 
-df_filtrado = eirox_v1430_enriquecer_venda_compra_cacheado(
-    _eirox_chave_filtros,
-    _eirox_sig_master,
-    _eirox_sig_venda,
-    _eirox_sig_compra,
-    _eirox_sig_contexto,
-    df_filtrado,
-    simulacao_global if "simulacao_global" in globals() else None,
-    _compra_contexto_municipio if "_compra_contexto_municipio" in globals() else (compra if "compra" in globals() else None),
-)
+# V1.4.70 — no Dashboard Geral este enriquecimento é redundante:
+# a base mestre já contém venda/custo e o simulador unificado é calculado na tela.
+if str(pagina).strip() != "📊 Dashboard Geral":
+    df_filtrado = eirox_v1430_enriquecer_venda_compra_cacheado(
+        _eirox_chave_filtros,
+        _eirox_sig_master,
+        _eirox_sig_venda,
+        _eirox_sig_compra,
+        _eirox_sig_contexto,
+        df_filtrado,
+        simulacao_global if "simulacao_global" in globals() else None,
+        _compra_contexto_municipio if "_compra_contexto_municipio" in globals() else (compra if "compra" in globals() else None),
+    ).copy(deep=True)
 
 
 
@@ -16348,12 +20903,8 @@ def _eirox_first_col(df, nomes):
     return None
 
 def _eirox_moeda_num(v):
-    try:
-        if pd.isna(v):
-            return ""
-        return f"{eirox_brl(float(v))}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return ""
+    return eirox_brl(v, vazio="")
+
 
 def _eirox_pct_num(v):
     try:
@@ -16703,63 +21254,11 @@ def eirox_qd_recuperar_cadastro(base):
 
 
 def eirox_fin_padronizar_ganho(df):
-    """
-    Padroniza ganhos financeiros antes de exibição/exportação.
-    Mantém exatamente:
-    Ganho Produto = Ganho Unitário x Quantidade.
-    """
+    """Normalização visual segura: não recalcula nem substitui ganhos."""
     if not isinstance(df, pd.DataFrame) or df.empty:
         return df
+    return df.copy()
 
-    out = df.copy()
-
-    # possíveis nomes finais usados nas tabelas/exportações
-    ganho_unit_cols = [
-        "Ganho Unitário", "Ganho Unitario",
-        "Ganho_Lucro_Unitario_Eirox"
-    ]
-    qtd_cols = [
-        "Qtd Vendida", "Qtd_Vendida_Eirox",
-        "Qtd Vendida Mês Anterior", "Qtd_Vendida_Mes_Anterior",
-        "Quantidade Vendida"
-    ]
-    ganho_prod_cols = [
-        "Ganho Produto", "Ganho Potencial",
-        "Ganho_Lucro_Potencial_Eirox"
-    ]
-
-    c_gu = next((c for c in ganho_unit_cols if c in out.columns), None)
-    c_qt = next((c for c in qtd_cols if c in out.columns), None)
-    c_gp = next((c for c in ganho_prod_cols if c in out.columns), None)
-
-    if c_gu:
-        out[c_gu] = pd.to_numeric(out[c_gu], errors="coerce").fillna(0).round(2)
-
-    if c_qt:
-        out[c_qt] = pd.to_numeric(out[c_qt], errors="coerce").fillna(0)
-
-    if c_gu and c_qt:
-        calculado = (
-            pd.to_numeric(out[c_gu], errors="coerce").fillna(0)
-            * pd.to_numeric(out[c_qt], errors="coerce").fillna(0)
-        ).round(2)
-
-        if c_gp:
-            out[c_gp] = calculado
-        else:
-            out["Ganho Produto"] = calculado
-
-    # arredondamento das colunas financeiras usuais
-    for c in [
-        "Preço Atual", "Preço Sugerido", "Menor Preço Concorrente",
-        "Custo Unitário", "Custo Unitario",
-        "Preço_Atual_Eirox", "Preço_Sugerido_Eirox",
-        "Custo_Unitario_Eirox", "Impacto_Financeiro_Eirox"
-    ]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
-
-    return out
 
 
 
@@ -17425,16 +21924,16 @@ def eirox_qd_sanitizar(base):
     return d
 
 
-def eirox_motor_oportunidades(base, margem_minima=EIROX_MARGEM_MINIMA_PADRAO):
+def _v143_original_eirox_motor_oportunidades(base, margem_minima=EIROX_MARGEM_MINIMA_PADRAO):
     if not isinstance(base, pd.DataFrame) or base.empty:
         return pd.DataFrame()
 
     d = base.copy()
 
     c_preco = _eirox_first_col(d, [
+        "Preco_Ultima_Venda", "Preço Última Venda", "Preco Ultima Venda",
         "Preço Principal","Preco Principal","Preço_Atual","Preco_Atual",
-        "Preço Atual","Preco Atual","Preco_Medio","Preço Médio",
-        "Preço (R$)","Preco (R$)"
+        "Preço Atual","Preco Atual"
     ])
     c_mercado = _eirox_first_col(d, [
         "Menor Preço Concorrente","Menor_Preco_Concorrente",
@@ -17467,11 +21966,29 @@ def eirox_motor_oportunidades(base, margem_minima=EIROX_MARGEM_MINIMA_PADRAO):
             c_custo = "_Custo_Unitario_Eirox"
 
     d["Preço_Atual_Eirox"] = _eirox_num(d[c_preco]) if c_preco else np.nan
+    c_ref_calc = _eirox_first_col(d, [
+        "Preco_Referencia_Calculo", "Preço Referência Cálculo",
+        "Preco Referencia Calculo", "Preco_Referencia_Mensal"
+    ])
+    d["Preço_Referencia_Calculo_Eirox"] = _eirox_num(d[c_ref_calc]) if c_ref_calc else np.nan
+    d["Preço_Base_Calculo_Eirox"] = d["Preço_Atual_Eirox"].where(
+        d["Preço_Atual_Eirox"].notna() & (d["Preço_Atual_Eirox"] > 0),
+        d["Preço_Referencia_Calculo_Eirox"]
+    )
+    d["Fonte_Preço_Eirox"] = np.where(
+        d["Preço_Atual_Eirox"].notna() & (d["Preço_Atual_Eirox"] > 0),
+        "ÚLTIMA VENDA",
+        np.where(
+            d["Preço_Referencia_Calculo_Eirox"].notna() & (d["Preço_Referencia_Calculo_Eirox"] > 0),
+            "REFERÊNCIA MENSAL",
+            "SEM PREÇO"
+        )
+    )
     d["Preço_Mercado_Eirox"] = _eirox_num(d[c_mercado]) if c_mercado else np.nan
     d["Custo_Unitario_Eirox"] = _eirox_num(d[c_custo]) if c_custo else np.nan
     d["Qtd_Vendida_Eirox"] = _eirox_num(d[c_qtd]).fillna(0) if c_qtd else 0
 
-    p = d["Preço_Atual_Eirox"]
+    p = d["Preço_Base_Calculo_Eirox"]
     m = d["Preço_Mercado_Eirox"]
     c = d["Custo_Unitario_Eirox"]
 
@@ -17501,12 +22018,13 @@ def eirox_motor_oportunidades(base, margem_minima=EIROX_MARGEM_MINIMA_PADRAO):
 
     if c_ganho:
         ganho_exist = _eirox_num(d[c_ganho]).fillna(0).abs()
-        d["Impacto_Financeiro_Eirox"] = np.maximum(impacto_volume.fillna(0), ganho_exist)
+        # V1.4.52: histórico não pode inflar o impacto corrente.
+        d["Impacto_Financeiro_Eirox"] = impacto_volume.fillna(0)
     else:
         d["Impacto_Financeiro_Eirox"] = impacto_volume.fillna(0)
 
     mask_neg = d["Recomendacao_Central"].eq("NEGOCIAR COMPRA")
-    impacto_neg = d["Reducao_Custo_Necessaria_Eirox"] * d["Qtd_Vendida_Eirox"].replace(0, 1)
+    impacto_neg = d["Reducao_Custo_Necessaria_Eirox"] * d["Qtd_Vendida_Eirox"].clip(lower=0)
     d.loc[mask_neg, "Impacto_Financeiro_Eirox"] = impacto_neg[mask_neg]
 
 
@@ -17525,7 +22043,7 @@ def eirox_motor_oportunidades(base, margem_minima=EIROX_MARGEM_MINIMA_PADRAO):
     # Ganho Unitário x Quantidade = Ganho Produto.
     d["Ganho_Lucro_Unitario_Eirox"] = (
         pd.to_numeric(d["Preço_Sugerido_Eirox"], errors="coerce")
-        - pd.to_numeric(d["Preço_Atual_Eirox"], errors="coerce")
+        - pd.to_numeric(d["Preço_Base_Calculo_Eirox"], errors="coerce")
     ).clip(lower=0).fillna(0).round(2)
 
     d["Qtd_Vendida_Eirox"] = (
@@ -17546,6 +22064,110 @@ def eirox_motor_oportunidades(base, margem_minima=EIROX_MARGEM_MINIMA_PADRAO):
 
     return d
 
+
+
+
+def eirox_motor_oportunidades(base, margem_minima=EIROX_MARGEM_MINIMA_PADRAO):
+    d = eirox_v143_aplicar_preco(base)
+    if not isinstance(d, pd.DataFrame) or d.empty:
+        return pd.DataFrame()
+
+    final = pd.to_numeric(
+        d.get("Preco_Ultima_Venda", pd.Series(np.nan,index=d.index)),
+        errors="coerce"
+    )
+    ref = pd.to_numeric(
+        d.get("Preco_Referencia_Calculo", pd.Series(np.nan,index=d.index)),
+        errors="coerce"
+    )
+    # V7.1 — preço do motor é estritamente o preço canônico.
+    # Preco_Referencia_Calculo permanece somente para auditoria e nunca
+    # substitui a ausência de VENDA_TESTE / VENDA_FINAL_TESTE.
+    calc = final.where(final.notna() & final.gt(0), np.nan)
+
+    temp = d.copy()
+    temp["Preco_Ultima_Venda"] = calc
+    temp["Preco_Atual"] = calc
+    temp["Preco_Atual_Venda"] = calc
+
+    motor = _v143_original_eirox_motor_oportunidades(
+        temp, margem_minima=margem_minima
+    )
+    if not isinstance(motor,pd.DataFrame) or motor.empty:
+        return motor
+
+    final_m = final.reindex(motor.index)
+    ref_m = ref.reindex(motor.index)
+    calc_m = calc.reindex(motor.index)
+    fonte_m = d.get(
+        "Fonte_Preço_Eirox",
+        pd.Series("SEM PREÇO",index=d.index)
+    ).reindex(motor.index)
+
+    motor["Preço_Atual_Eirox"] = final_m
+    motor["Preço_Referencia_Calculo_Eirox"] = ref_m
+    motor["Preço_Base_Calculo_Eirox"] = calc_m
+    motor["Fonte_Preço_Eirox"] = fonte_m.fillna("SEM PREÇO")
+    return motor
+
+
+
+
+def eirox_v152_auditoria_financeira(base):
+    """Audita valores sem modificar a base ou inventar dados ausentes."""
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    d = eirox_motor_oportunidades(base)
+    if d.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    out = pd.DataFrame(index=d.index)
+    ce = _eirox_first_col(d, ["EAN", "EAN (GTIN)", "GTIN"])
+    out["EAN"] = d[ce].astype(str) if ce else ""
+    out["Ação"] = d["Recomendacao_Central"].astype(str)
+    out["Fonte Preço"] = d.get("Fonte_Preço_Eirox", "")
+    for destino, origem in [
+        ("Preço Atual", "Preço_Atual_Eirox"),
+        ("Preço Ref. Cálculo", "Preço_Base_Calculo_Eirox"),
+        ("Preço Sugerido", "Preço_Sugerido_Eirox"),
+        ("Custo Unitário", "Custo_Unitario_Eirox"),
+        ("Qtd Vendida", "Qtd_Vendida_Eirox"),
+        ("Ganho Registrado", "Ganho_Lucro_Potencial_Eirox"),
+        ("Impacto Registrado", "Impacto_Financeiro_Eirox"),
+    ]:
+        out[destino] = pd.to_numeric(d.get(origem, pd.Series(np.nan,index=d.index)),errors="coerce")
+    p=out["Preço Atual"]
+    r=out["Preço Ref. Cálculo"]
+    s=out["Preço Sugerido"]
+    c=out["Custo Unitário"]
+    q=out["Qtd Vendida"]
+    subir=out["Ação"].eq("SUBIR PREÇO")
+    valido=subir & p.gt(0) & s.gt(p) & c.notna() & c.ge(0) & q.gt(0)
+    out["Ganho Conferido"] = np.nan
+    out.loc[valido,"Ganho Conferido"] = (
+        (s[valido]-p[valido]).round(2)*q[valido]
+    ).round(2)
+    out["Diferença Ganho"] = out["Ganho Registrado"]-out["Ganho Conferido"]
+    out["Situação"] = "OK"
+    out.loc[p.isna() | p.le(0),"Situação"] = "SEM PREÇO ATUAL"
+    out.loc[c.isna() | c.lt(0),"Situação"] = "CUSTO NÃO VALIDADO"
+    out.loc[q.isna() | q.lt(0),"Situação"] = "QUANTIDADE NÃO VALIDADA"
+    out.loc[subir & q.eq(0),"Situação"] = "SEM VOLUME PARA PROJEÇÃO"
+    out.loc[subir & p.gt(0) & s.gt(0) & s.le(p),"Situação"] = "SUGESTÃO NÃO SUPERA PREÇO"
+    out.loc[subir & p.gt(0) & r.gt(0) & (p-r).abs().gt(0.005),"Situação"] = "PREÇO EXIBIDO DIFERE DA BASE"
+    out.loc[valido & out["Diferença Ganho"].abs().gt(0.011),"Situação"] = "GANHO DIVERGENTE"
+    out.loc[subir & out["Ganho Conferido"].notna() & out["Ganho Registrado"].isna(),"Situação"] = "GANHO AUSENTE"
+    out["Duplicidade EAN"] = out["EAN"].ne("") & out["EAN"].duplicated(keep=False)
+    resumo = out.groupby("Ação",dropna=False).agg(
+        Registros=("EAN","size"),
+        EANs=("EAN","nunique"),
+        Ganho_Registrado=("Ganho Registrado","sum"),
+        Ganho_Conferido=("Ganho Conferido","sum"),
+        Impacto_Registrado=("Impacto Registrado","sum"),
+        Divergencias=("Situação",lambda s: int(s.ne("OK").sum())),
+        EANs_Duplicados=("Duplicidade EAN","sum"),
+    ).reset_index()
+    return out.reset_index(drop=True), resumo
+
 def eirox_resumo_oportunidades(base):
     d = eirox_motor_oportunidades(base)
     if d.empty:
@@ -17563,7 +22185,7 @@ def eirox_resumo_oportunidades(base):
         "subir": int(rec.eq("SUBIR PREÇO").sum()),
         "baixar": int(rec.eq("BAIXAR PREÇO").sum()),
         "negociar": int(rec.eq("NEGOCIAR COMPRA").sum()),
-        "captura": float(d.loc[rec.eq("SUBIR PREÇO"), "Impacto_Financeiro_Eirox"].fillna(0).sum()),
+        "captura": float(d.loc[rec.eq("SUBIR PREÇO"), "Ganho_Lucro_Potencial_Eirox"].fillna(0).sum()),
         "reducao_custo": float(d.loc[rec.eq("NEGOCIAR COMPRA"), "Impacto_Financeiro_Eirox"].fillna(0).sum()),
         "margem_projetada": float(margem_s.dropna().mean()) if margem_s.notna().any() else np.nan
     }
@@ -17843,17 +22465,21 @@ def eirox_estilizar_tabela_core(df):
 
     if "Ação" in df.columns:
         styler = styler.map(_cor_acao_core, subset=["Ação"])
+    if "Recomendação" in df.columns:
+        styler = styler.map(_cor_acao_core, subset=["Recomendação"])
 
     if "Flag Preço" in df.columns:
         styler = styler.map(_cor_flag_preco, subset=["Flag Preço"])
 
     if "Margem Atual" in df.columns:
         styler = styler.map(_cor_margem_core, subset=["Margem Atual"])
+    if "Margem Atual %" in df.columns:
+        styler = styler.map(_cor_margem_core, subset=["Margem Atual %"])
 
     if "Impacto" in df.columns:
         styler = styler.map(_cor_impacto_core, subset=["Impacto"])
 
-    for _c_lucro in ["Ganho de Lucro Unitário", "Ganho de Lucro Potencial"]:
+    for _c_lucro in ["Ganho de Lucro Unitário", "Ganho de Lucro Potencial", "Ganho Potencial"]:
         if _c_lucro in df.columns:
             styler = styler.map(_cor_impacto_core, subset=[_c_lucro])
 
@@ -18105,6 +22731,8 @@ def eirox_tabela_oportunidades(base, acao=None, limite=500):
         default="ℹ️ REVISAR"
     )
     out["Preço Atual"] = motor["Preço_Atual_Eirox"].apply(_eirox_moeda_num)
+    # V7.1 — a tabela recebe novamente a fonte canônica por EAN.
+    out = eirox_v271_aplicar_preco_canonico_tabela(out)
     out["Preço Mercado"] = motor["Preço_Mercado_Eirox"].apply(_eirox_moeda_num)
 
     # -------------------------------------------------------
@@ -18594,13 +23222,16 @@ def eirox_v61_render_subir_preco(base):
 # ================================================================
 # V63 - REGRA DEFINITIVA DE SUBIR PREÇO E GANHO REAL
 # ================================================================
+
 def eirox_v63_subidas_validas(base):
     """
-    Regra financeira:
-      SUBIR PREÇO somente quando Preço Sugerido/Competitivo > Preço Atual.
+    V1.4.59 — fonte única de ganho para Subir Preço, Dashboard, Executivo e Simulador.
 
-    O motor central é a fonte da classificação.
-    A recomendação antiga não pode forçar SUBIR se o mercado estiver abaixo.
+    Regra:
+      Preço Atual = regra oficial do Principal;
+      Preço Sugerido = motor central;
+      Volume = Itens do último mês fechado com venda do EAN;
+      Ganho = (Preço Sugerido - Preço Atual) x Volume.
     """
     if not isinstance(base, pd.DataFrame) or base.empty:
         return pd.DataFrame()
@@ -18609,75 +23240,149 @@ def eirox_v63_subidas_validas(base):
     if not isinstance(motor, pd.DataFrame) or motor.empty:
         return pd.DataFrame()
 
+    c_ean = _eirox_first_col(motor, ["EAN","EAN (GTIN)","GTIN"])
+    if not c_ean:
+        return pd.DataFrame()
+
+    motor = motor.copy()
+    motor["__EAN_V159"] = _ean(motor[c_ean])
+
     p = pd.to_numeric(motor["Preço_Atual_Eirox"], errors="coerce")
     mercado = pd.to_numeric(motor["Preço_Mercado_Eirox"], errors="coerce")
     sugerido = pd.to_numeric(motor["Preço_Sugerido_Eirox"], errors="coerce")
+    sugerido = sugerido.where(sugerido.notna() & sugerido.gt(0), mercado)
 
-    # Se o motor não tiver preenchido o sugerido, utiliza a referência de mercado.
-    sugerido = sugerido.where(sugerido.notna() & (sugerido > 0), mercado)
-
-    # Só é SUBIR quando há aumento real.
     mask_subir = (
-        p.notna() & (p > 0)
-        & sugerido.notna() & (sugerido > p)
+        p.notna() & p.gt(0)
+        & sugerido.notna() & sugerido.gt(p)
         & motor["Recomendacao_Central"].astype(str).eq("SUBIR PREÇO")
     )
 
-    m = motor[mask_subir].copy()
+    m = motor.loc[mask_subir].copy()
     if m.empty:
         return m
 
+    # Último mês fechado COM venda por EAN, usando a VENDA_FINAL_TESTE carregada.
+    _vf = globals().get("venda_rede", pd.DataFrame())
+    fechado = eirox_v158_ultimo_mes_fechado_memoria(_vf)
+    if isinstance(fechado, pd.DataFrame) and not fechado.empty:
+        fechado = fechado.copy()
+        fechado["EAN"] = _ean(fechado["EAN"])
+        fechado = fechado.drop_duplicates("EAN", keep="last")
+        m = m.merge(
+            fechado[[
+                "EAN","Venda_Mes_Fechado","Itens_Mes_Fechado",
+                "Mes_Fechado_Referencia"
+            ]],
+            left_on="__EAN_V159",
+            right_on="EAN",
+            how="left",
+            suffixes=("","_MES")
+        )
+        if "EAN_MES" in m.columns:
+            m = m.drop(columns=["EAN_MES"])
+    else:
+        m["Venda_Mes_Fechado"] = np.nan
+        m["Itens_Mes_Fechado"] = np.nan
+        m["Mes_Fechado_Referencia"] = ""
+
     p = pd.to_numeric(m["Preço_Atual_Eirox"], errors="coerce")
     sugerido = pd.to_numeric(m["Preço_Sugerido_Eirox"], errors="coerce")
-
-    m["Ganho_Lucro_Unitario_Eirox"] = (sugerido - p).clip(lower=0).fillna(0)
-
-    qtd = pd.to_numeric(
-        m.get("Qtd_Vendida_Eirox", pd.Series(0, index=m.index)),
-        errors="coerce"
-    ).fillna(0)
-
-    ganho_calculado = m["Ganho_Lucro_Unitario_Eirox"] * qtd
-
-    # Fallback histórico: em bases sem quantidade vendida, aproveita o ganho
-    # já calculado anteriormente no projeto, somente para ações válidas de subida.
-    c_ganho_hist = _eirox_first_col(
-        m,
-        [
-            "Ganho_Potencial",
-            "Ganho Potencial",
-            "Ganho_Potencial_Final",
-            "Ganho_Potencial_Atualizado",
-            "Ganho Produto"
-        ]
+    sugerido = sugerido.where(
+        sugerido.notna() & sugerido.gt(0),
+        pd.to_numeric(m["Preço_Mercado_Eirox"], errors="coerce")
     )
 
-    if c_ganho_hist:
-        ganho_hist = pd.to_numeric(m[c_ganho_hist], errors="coerce").fillna(0).clip(lower=0)
-        m["Ganho_Lucro_Potencial_Eirox"] = np.where(
-            qtd > 0,
-            ganho_calculado,
-            ganho_hist
-        )
-    else:
-        m["Ganho_Lucro_Potencial_Eirox"] = ganho_calculado
+    ganho_unit = (sugerido - p).clip(lower=0).round(2)
 
-    m["Impacto_Unitario_Eirox"] = m["Ganho_Lucro_Unitario_Eirox"]
-    m["Impacto_Financeiro_Eirox"] = m["Ganho_Lucro_Potencial_Eirox"]
+    # Volume oficial: último mês fechado. Sem volume fechado, não projeta ganho.
+    qtd = pd.to_numeric(m["Itens_Mes_Fechado"], errors="coerce").fillna(0)
+    ganho_pot = (ganho_unit * qtd).round(2)
 
-    # Indicadores úteis para auditoria.
+    m["Ganho_Lucro_Unitario_Eirox"] = ganho_unit
+    m["Ganho_Lucro_Potencial_Eirox"] = ganho_pot
+    m["Impacto_Unitario_Eirox"] = ganho_unit
+    m["Impacto_Financeiro_Eirox"] = ganho_pot
     m["Diferença_Subida_%_Eirox"] = np.where(
-        p > 0,
-        (sugerido - p) / p,
-        np.nan
+        p.gt(0), (sugerido - p) / p, np.nan
     )
     m["Qtd_Base_Ganho_Eirox"] = qtd
+    m["Qtd_Vendida_Eirox"] = qtd
+    m["Preço_Usado_no_Ganho_Eirox"] = p
+    m["Conferencia_Ganho_Eirox"] = (ganho_unit * qtd).round(2)
+
+    # Só permanece como oportunidade financeira quando existe volume fechado.
+    m = m[qtd.gt(0) & ganho_pot.gt(0)].copy()
 
     return m
 
 
+def eirox_v159_simulacao_unificada(base):
+    """
+    Monta o Simulador a partir da MESMA lista financeira de SUBIR PREÇO.
+    Portanto, total e produtos são idênticos ao Potencial de Captura.
+    """
+    sub = eirox_v63_subidas_validas(base)
+    if not isinstance(sub, pd.DataFrame) or sub.empty:
+        return pd.DataFrame()
+
+    c_ean = _eirox_first_col(sub, ["EAN","EAN (GTIN)","GTIN"])
+    c_prod = _eirox_first_col(sub, ["Produto","Descrição","Descricao","Produto na Pesquisa"])
+
+    out = pd.DataFrame(index=sub.index)
+    out["EAN"] = _ean(sub[c_ean]) if c_ean else ""
+    if c_prod:
+        out["Produto_Simulador"] = sub[c_prod].astype(str)
+
+    out["Mes_Fechado_Referencia"] = sub.get(
+        "Mes_Fechado_Referencia", pd.Series("", index=sub.index)
+    )
+    out["Qtd_Vendida_Mes_Anterior"] = pd.to_numeric(
+        sub.get("Qtd_Base_Ganho_Eirox", 0), errors="coerce"
+    ).fillna(0)
+    out["Venda_Real_Mes_Fechado"] = pd.to_numeric(
+        sub.get("Venda_Mes_Fechado", np.nan), errors="coerce"
+    )
+    out["Preco_Atual"] = pd.to_numeric(sub["Preço_Atual_Eirox"], errors="coerce")
+    out["Preco_Sugerido_Mercado"] = pd.to_numeric(sub["Preço_Sugerido_Eirox"], errors="coerce")
+    out["Venda_Preco_Antigo"] = (
+        out["Preco_Atual"] * out["Qtd_Vendida_Mes_Anterior"]
+    ).round(2)
+    out["Venda_Projetada_Preco_Sugerido"] = (
+        out["Preco_Sugerido_Mercado"] * out["Qtd_Vendida_Mes_Anterior"]
+    ).round(2)
+    out["Ganho_Unitario"] = pd.to_numeric(
+        sub["Ganho_Lucro_Unitario_Eirox"], errors="coerce"
+    )
+    out["Ganho_Potencial_Simulador"] = pd.to_numeric(
+        sub["Ganho_Lucro_Potencial_Eirox"], errors="coerce"
+    )
+
+    if "Menor Preço Concorrente" in sub.columns:
+        out["Menor_Preco"] = pd.to_numeric(
+            sub["Menor Preço Concorrente"], errors="coerce"
+        )
+    else:
+        out["Menor_Preco"] = pd.to_numeric(
+            sub["Preço_Mercado_Eirox"], errors="coerce"
+        )
+
+    if "Loja do Menor Preço" in sub.columns:
+        out["Rede_Menor_Preco"] = sub["Loja do Menor Preço"].fillna("").astype(str)
+        out["Rede_Preco_Maximo_Competitivo"] = out["Rede_Menor_Preco"]
+    if "Data da Pesquisa" in sub.columns:
+        out["Data_Menor_Preco"] = sub["Data da Pesquisa"]
+        out["Data_Preco_Maximo_Competitivo"] = sub["Data da Pesquisa"]
+
+    return out.reset_index(drop=True)
+
+
+
+
+
 
 @st.cache_data(show_spinner=False, ttl=3600)
+
 def eirox_v147_mapa_menor_preco_bruto(_assinatura_venda=""):
     """Mapa atômico EAN -> menor preço/loja/data direto da VENDA_TESTE.
 
@@ -18828,12 +23533,6 @@ def eirox_v147_corrigir_lista_subir_final(tab):
             ps = pm
             out.at[idx, "Preço Sugerido"] = _eirox_moeda_num(ps)
 
-        # Relação exata já usada pelo próprio relatório: aumento = sugerido - atual.
-        if (pd.isna(pa) or pa <= 0) and pd.notna(ps) and pd.notna(au) and ps > au >= 0:
-            pa = ps - au
-            if pa > 0:
-                out.at[idx, "Preço Atual"] = _eirox_moeda_num(pa)
-
         # Menor preço/loja/data atômicos da VENDA_TESTE, todos da mesma linha.
         ean = ""
         if "EAN" in out.columns:
@@ -18852,22 +23551,147 @@ def eirox_v147_corrigir_lista_subir_final(tab):
                 if "Data da Pesquisa" in out.columns and atom.get("data"):
                     out.at[idx, "Data da Pesquisa"] = atom["data"]
 
-        # Custo unitário: recuperado de uma identidade já exibida no relatório.
-        # Margem Atual = (Preço Atual - Custo) / Preço Atual.
-        cu = _num(out.at[idx, "Custo Unitário"]) if "Custo Unitário" in out.columns else np.nan
-        if (pd.isna(cu) or cu <= 0) and pd.notna(pa) and pa > 0 and "Margem Atual" in out.columns:
-            mg = _num(out.at[idx, "Margem Atual"])
-            if pd.notna(mg):
-                # Percentuais chegam como 30,9 / -4,2 / 100,0.
-                # Normaliza tanto margens positivas quanto negativas.
-                if abs(mg) > 1:
-                    mg = mg / 100.0
-                if -10 < mg <= 1:
-                    cu_calc = pa * (1.0 - mg)
-                    if cu_calc >= 0:
-                        out.at[idx, "Custo Unitário"] = _eirox_moeda_num(cu_calc)
+
+
+    # V1.4.49 — barreira visual final com prioridade VENDA_TESTE e
+    # fallback VENDA_FINAL_TESTE do último mês fechado (Venda / Itens).
+    try:
+        _mapa = eirox_v146_preco_principal()
+        if isinstance(_mapa, pd.DataFrame) and not _mapa.empty and "EAN" in out.columns:
+            _lk = _mapa.drop_duplicates("EAN", keep="last").set_index("EAN")
+            _keys = _ean(out["EAN"])
+            _preco = _keys.map(_lk["Preco_Principal_Final"])
+            _fonte = _keys.map(_lk["Fonte_Preco_Principal"]).fillna("SEM PREÇO")
+            _data = _keys.map(_lk["Data_Ultima_Venda"])
+            _mes = _keys.map(_lk["Mes_Fechado_Referencia"])
+
+            # O preço do motor é a fonte da tela e do ganho.
+            # A consulta à fonte serve apenas para conferir a procedência.
+            out["Flag Preço"] = _fonte.map({
+                "ÚLTIMA VENDA": "✅ ÚLTIMA VENDA",
+                "ÚLTIMO MÊS FECHADO": "🟡 ÚLTIMO MÊS FECHADO",
+                "SEM PREÇO": "⚠️ SEM PREÇO"
+            }).fillna("⚠️ SEM PREÇO")
+            out["Data Última Venda"] = [
+                v.strftime("%d/%m/%Y %H:%M:%S") if pd.notna(v) else ""
+                for v in _data
+            ]
+            # V1.4.49 — Mês Ref. Venda pertence exclusivamente ao
+            # fallback da VENDA_FINAL_TESTE. Quando a fonte é VENDA_TESTE,
+            # exibimos apenas Data Última Venda.
+            out["Mês Ref. Venda"] = [
+                (
+                    str(mes)
+                    if str(fonte) == "ÚLTIMO MÊS FECHADO"
+                    and pd.notna(mes)
+                    and str(mes).lower() not in ("nan","nat","none","")
+                    else ""
+                )
+                for fonte, mes in zip(_fonte, _mes)
+            ]
+
+
+    except Exception:
+        pass
 
     return out.reset_index(drop=True)
+
+
+
+# ==========================================================
+# EIROX PRICING 2.0 — V7.1
+# BARREIRA FINAL DO PREÇO ATUAL
+# ==========================================================
+# O Preço Atual pode ter somente duas origens:
+# 1) VENDA_TESTE — última pesquisa válida do CNPJ Principal;
+# 2) VENDA_FINAL_TESTE — Venda / Itens do último mês fechado com venda.
+# Sem uma dessas origens, o produto fica SEM PREÇO.
+_eirox_v147_legacy_corrigir_lista_subir_final = eirox_v147_corrigir_lista_subir_final
+
+def eirox_v271_mapa_preco_canonico():
+    try:
+        mapa = eirox_v146_preco_principal()
+        if not isinstance(mapa, pd.DataFrame) or mapa.empty:
+            return pd.DataFrame(columns=[
+                "EAN", "Preco_Principal_Final", "Fonte_Preco_Principal",
+                "Data_Ultima_Venda", "Mes_Fechado_Referencia"
+            ])
+        m = mapa.copy()
+        m["EAN"] = _ean(m["EAN"])
+        m["Preco_Principal_Final"] = pd.to_numeric(
+            m["Preco_Principal_Final"], errors="coerce"
+        )
+        m = m[
+            m["EAN"].ne("")
+            & m["Preco_Principal_Final"].notna()
+            & m["Preco_Principal_Final"].gt(0)
+        ].drop_duplicates("EAN", keep="last")
+        return m
+    except Exception:
+        return pd.DataFrame(columns=[
+            "EAN", "Preco_Principal_Final", "Fonte_Preco_Principal",
+            "Data_Ultima_Venda", "Mes_Fechado_Referencia"
+        ])
+
+
+def eirox_v271_aplicar_preco_canonico_tabela(tab):
+    if not isinstance(tab, pd.DataFrame) or tab.empty or "EAN" not in tab.columns:
+        return tab
+
+    out = tab.copy()
+    mapa = eirox_v271_mapa_preco_canonico()
+    keys = _ean(out["EAN"])
+
+    if isinstance(mapa, pd.DataFrame) and not mapa.empty:
+        lk = mapa.set_index("EAN")
+        preco = keys.map(lk["Preco_Principal_Final"])
+        fonte = keys.map(lk["Fonte_Preco_Principal"]).fillna("SEM PREÇO")
+        data = keys.map(lk["Data_Ultima_Venda"])
+        mes = keys.map(lk["Mes_Fechado_Referencia"])
+    else:
+        preco = pd.Series(np.nan, index=out.index, dtype="float64")
+        fonte = pd.Series("SEM PREÇO", index=out.index, dtype="object")
+        data = pd.Series(pd.NaT, index=out.index)
+        mes = pd.Series("", index=out.index, dtype="object")
+
+    # Sobrescreve qualquer preço visual/calculado legado. Não há terceiro fallback.
+    if "Preço Atual" in out.columns:
+        out["Preço Atual"] = [
+            _eirox_moeda_num(v) if pd.notna(v) and float(v) > 0 else ""
+            for v in preco
+        ]
+
+    out["Fonte Preço Atual"] = fonte.map({
+        "ÚLTIMA VENDA": "VENDA_TESTE — ÚLTIMA PESQUISA PRINCIPAL",
+        "ÚLTIMO MÊS FECHADO": "VENDA_FINAL_TESTE — ÚLTIMO MÊS FECHADO",
+        "SEM PREÇO": "SEM PREÇO",
+    }).fillna("SEM PREÇO")
+
+    out["Data/Competência Preço"] = [
+        (
+            d.strftime("%d/%m/%Y %H:%M:%S")
+            if str(f) == "ÚLTIMA VENDA" and pd.notna(d)
+            else (
+                str(m)
+                if str(f) == "ÚLTIMO MÊS FECHADO"
+                and pd.notna(m)
+                and str(m).strip().lower() not in {"", "nan", "nat", "none"}
+                else ""
+            )
+        )
+        for f, d, m in zip(fonte, data, mes)
+    ]
+    return out
+
+
+def eirox_v147_corrigir_lista_subir_final(tab):
+    # Mantém apenas os enriquecimentos visuais legados que não definem a
+    # verdade do preço; ao final, a barreira canônica sobrescreve Preço Atual.
+    try:
+        out = _eirox_v147_legacy_corrigir_lista_subir_final(tab)
+    except Exception:
+        out = tab.copy() if isinstance(tab, pd.DataFrame) else tab
+    return eirox_v271_aplicar_preco_canonico_tabela(out)
 
 
 def eirox_v63_tabela_subidas(base):
@@ -18907,8 +23731,20 @@ def eirox_v63_tabela_subidas(base):
         out["Laboratório"] = motor[c_lab].astype(str)
 
     out["Ação"] = "SUBIR PREÇO"
-    out["Flag Preço"] = "🚩 PREÇO CALCULADO"
-    out["Preço Atual"] = motor["Preço_Atual_Eirox"].apply(_eirox_moeda_num)
+    out["Flag Preço"] = motor.get(
+        "Fonte_Preço_Eirox", pd.Series("SEM PREÇO", index=motor.index)
+    ).map({
+        "ÚLTIMA VENDA": "✅ ÚLTIMA VENDA",
+        "REFERÊNCIA MENSAL": "⚠️ REFERÊNCIA MENSAL",
+        "SEM PREÇO": "⚠️ SEM PREÇO"
+    }).fillna("⚠️ SEM PREÇO")
+    out["Preço Atual"] = motor["Preço_Atual_Eirox"].apply(
+        lambda x: _eirox_moeda_num(x) if pd.notna(x) and float(x) > 0 else ""
+    )
+    out = eirox_v271_aplicar_preco_canonico_tabela(out)
+    out["Preço Ref. Cálculo"] = motor["Preço_Base_Calculo_Eirox"].apply(
+        lambda x: _eirox_moeda_num(x) if pd.notna(x) and float(x) > 0 else ""
+    )
     out["Preço Mercado"] = motor["Preço_Mercado_Eirox"].apply(_eirox_moeda_num)
 
     if "Menor Preço Concorrente" in motor.columns:
@@ -18935,11 +23771,16 @@ def eirox_v63_tabela_subidas(base):
         motor["Qtd_Base_Ganho_Eirox"], errors="coerce"
     ).fillna(0).round(0).astype(int)
     out["Ganho de Lucro Potencial"] = motor["Ganho_Lucro_Potencial_Eirox"].apply(_eirox_moeda_num)
+    # V1.4.50 — preço efetivamente usado no cálculo do ganho.
+    out["Preço Usado no Ganho"] = motor["Preço_Usado_no_Ganho_Eirox"].apply(
+        lambda x: _eirox_moeda_num(x) if pd.notna(x) and float(x) > 0 else ""
+    )
     out["Custo Unitário"] = motor["Custo_Unitario_Eirox"].apply(_eirox_moeda_num)
     out["Margem Atual"] = motor["Margem_Atual_Eirox"].apply(_eirox_pct_num)
 
     out = eirox_fin_padronizar_ganho(out)
     out = eirox_fin_padronizar_ganho(out)
+
     out = eirox_v142_data_final_unica(
         out,
         historico if "historico" in globals() else None
@@ -19004,10 +23845,6 @@ def eirox_v63_tabela_subidas(base):
                     return txt in ("", "none", "nan", "nat", "r$ nan")
 
                 for idx in out.index:
-                    if "Preço Atual" in out.columns and _v1418_vazio(out.at[idx, "Preço Atual"]):
-                        if pd.notna(_pa.iloc[idx]) and _pa.iloc[idx] > 0:
-                            out.at[idx, "Preço Atual"] = _eirox_moeda_num(_pa.iloc[idx])
-
                     if "Menor Preço Concorrente" in out.columns and _v1418_vazio(out.at[idx, "Menor Preço Concorrente"]):
                         if pd.notna(_mp.iloc[idx]) and _mp.iloc[idx] > 0:
                             out.at[idx, "Menor Preço Concorrente"] = _eirox_moeda_num(_mp.iloc[idx])
@@ -19022,18 +23859,7 @@ def eirox_v63_tabela_subidas(base):
                         if "Preço Mercado" in out.columns and not _v1418_vazio(out.at[idx, "Preço Mercado"]):
                             out.at[idx, "Preço Sugerido"] = out.at[idx, "Preço Mercado"]
 
-                # Fallback matemático somente para Preço Atual: o próprio
-                # relatório já possui Preço Sugerido e Aumento Unitário.
-                for idx in out.index:
-                    if "Preço Atual" in out.columns and _v1418_vazio(out.at[idx, "Preço Atual"]):
-                        try:
-                            ps = _numero_br_para_float_eirox(out.at[idx, "Preço Sugerido"])
-                            gu = _numero_br_para_float_eirox(out.at[idx, "Aumento Unitário"])
-                            calc = float(ps) - float(gu)
-                            if calc > 0:
-                                out.at[idx, "Preço Atual"] = _eirox_moeda_num(calc)
-                        except Exception:
-                            pass
+
     except Exception:
         pass
 
@@ -19337,8 +24163,40 @@ df_filtrado = eirox_v142_data_final_unica(
     historico if "historico" in globals() else None
 )
 
+# Fase 7 — exportação padronizada e sob demanda da seleção atual.
+try:
+    eirox_v270_render_exportacao_global(
+        df_filtrado,
+        pagina,
+        globals().get("_eirox_chave_filtros", globals().get("_eirox_chave_filtro_leve_v270", "")),
+    )
+except Exception:
+    pass
+
 # TELAS CENTRAIS - PROPOSTA VISUAL APROVADA
 # --------------------------------------------------
+if pagina == "💰 Resultado Realizado":
+    eirox_v260_render(df)
+    st.stop()
+
+
+if pagina == "📋 Plano de Ações":
+    eirox_v250_render_plano_acoes(df)
+    st.stop()
+
+
+if pagina == "🧪 Central de Qualidade":
+    if not usuario_master():
+        st.error("Acesso restrito à administração.")
+        st.stop()
+    eirox_v240_render_central_qualidade(df)
+    st.stop()
+
+
+if pagina == "🎯 Prioridade de Pesquisa":
+    eirox_render_prioridade_pesquisa(df)
+    st.stop()
+
 if pagina == "📊 Geral":
     eirox_render_dashboard_pdf(df_filtrado)
     st.stop()
@@ -20415,7 +25273,6 @@ if pagina == "📋 Workflow Comercial":
 
 
 # --------------------------------------------------
-
 
 def eirox_formatar_view_ia(df_view):
     if not isinstance(df_view, pd.DataFrame) or df_view.empty:
@@ -24520,17 +29377,23 @@ if pagina == "🏢 Dashboard Executivo":
         unsafe_allow_html=True
     )
 
-    base_exec = df_filtrado.copy()
-    base_exec = propagar_ganho_potencial(base_exec)
+    base_exec = aplicar_engine_recomendacoes_restaurada(df_filtrado.copy())
 
     total_produtos = len(base_exec)
 
-    ganho_total = 0
-    if "Ganho_Potencial" in base_exec.columns:
-        ganho_total = pd.to_numeric(
-            base_exec["Ganho_Potencial"],
-            errors="coerce"
-        ).fillna(0).sum()
+    # V1.4.59 — mesmo total do Dashboard Geral / Subir / Simulador.
+    try:
+        _sim_exec_v159 = eirox_v159_simulacao_unificada(df_filtrado.copy())
+        ganho_total = (
+            pd.to_numeric(
+                _sim_exec_v159["Ganho_Potencial_Simulador"], errors="coerce"
+            ).fillna(0).sum()
+            if isinstance(_sim_exec_v159, pd.DataFrame)
+            and not _sim_exec_v159.empty
+            else 0.0
+        )
+    except Exception:
+        ganho_total = 0.0
 
     margem_media = 0
     if "Margem_%" in base_exec.columns:
@@ -25153,24 +30016,22 @@ if pagina == "🔎 Rede/Loja vs Concorrentes":
 
         if not base_principal_visual.empty:
 
-            preco_selecionado = (
-                base_principal_visual
-                .dropna(
-                    subset=[
-                        "EAN",
-                        "Preço (R$)"
-                    ]
+            _principal_ultimo = eirox_ultimo_preco_principal_por_ean(base_principal_visual)
+            if not _principal_ultimo.empty:
+                _qtd_principal = (
+                    base_principal_visual.dropna(subset=["EAN", "Preço (R$)"])
+                    .groupby("EAN")["Preço (R$)"].count().to_dict()
                 )
-                .groupby("EAN")
-                .agg(
-                    Produto_Pesquisa=("Produto", "first"),
-                    Preco_Selecionado=("Preço (R$)", "mean"),
-                    Qtd_Pesquisas_Selecionado=("Preço (R$)", "count"),
-                    Farmacia_Selecionada=("Farmácia", "first"),
-                    Rede_Selecionada=("Rede", "first")
-                )
-                .reset_index()
-            )
+                preco_selecionado = pd.DataFrame({
+                    "EAN": _principal_ultimo["EAN"],
+                    "Produto_Pesquisa": _principal_ultimo["Produto"] if "Produto" in _principal_ultimo.columns else "",
+                    "Preco_Selecionado": pd.to_numeric(_principal_ultimo["Preço (R$)"], errors="coerce"),
+                    "Qtd_Pesquisas_Selecionado": _principal_ultimo["EAN"].map(_qtd_principal).fillna(1),
+                    "Farmacia_Selecionada": _principal_ultimo["Farmácia"] if "Farmácia" in _principal_ultimo.columns else "",
+                    "Rede_Selecionada": _principal_ultimo["Rede"] if "Rede" in _principal_ultimo.columns else "",
+                })
+            else:
+                preco_selecionado = pd.DataFrame()
 
             # Para o cliente principal, usa a base interna de produtos/preço atual
             # quando ela possuir mais produtos do que as pesquisas do próprio CNPJ.
@@ -25720,24 +30581,19 @@ if pagina == "🛒 Negociação Compras":
             # PREÇO PRINCIPAL
             # --------------------------------------------------
 
-            preco_principal = (
-                base_principal
-                .dropna(
-                    subset=[
-                        "EAN",
-                        "Preço (R$)"
-                    ]
-                )
-                .groupby("EAN")
-                .agg(
-                    Produto_Pesquisa=("Produto", "first"),
-                    Preco_Principal=("Preço (R$)", "mean"),
-                    Qtd_Pesquisas_Principal=("Preço (R$)", "count"),
-                    Farmacia_Principal=("Farmácia", "first"),
-                    Rede_Principal=("Rede", "first")
-                )
-                .reset_index()
+            _principal_ultimo = eirox_ultimo_preco_principal_por_ean(base_principal)
+            _qtd_principal = (
+                base_principal.dropna(subset=["EAN", "Preço (R$)"])
+                .groupby("EAN")["Preço (R$)"].count().to_dict()
             )
+            preco_principal = pd.DataFrame({
+                "EAN": _principal_ultimo["EAN"],
+                "Produto_Pesquisa": _principal_ultimo["Produto"] if "Produto" in _principal_ultimo.columns else "",
+                "Preco_Principal": pd.to_numeric(_principal_ultimo["Preço (R$)"], errors="coerce"),
+                "Qtd_Pesquisas_Principal": _principal_ultimo["EAN"].map(_qtd_principal).fillna(1),
+                "Farmacia_Principal": _principal_ultimo["Farmácia"] if "Farmácia" in _principal_ultimo.columns else "",
+                "Rede_Principal": _principal_ultimo["Rede"] if "Rede" in _principal_ultimo.columns else "",
+            }) if not _principal_ultimo.empty else pd.DataFrame()
 
             # --------------------------------------------------
             # MENOR PREÇO CONCORRENTE
@@ -26451,24 +31307,19 @@ if pagina == "🚨 Central de Alertas":
             and "EAN" in base_concorrente_alerta.columns
         ):
 
-            principal = (
-                base_principal_alerta
-                .dropna(
-                    subset=[
-                        "EAN",
-                        "Preço (R$)"
-                    ]
-                )
-                .groupby("EAN")
-                .agg(
-                    Produto_Pesquisa=("Produto", "first"),
-                    Preco_Principal=("Preço (R$)", "mean"),
-                    Qtd_Pesquisas_Principal=("Preço (R$)", "count"),
-                    Farmacia_Principal=("Farmácia", "first"),
-                    Rede_Principal=("Rede", "first")
-                )
-                .reset_index()
+            _principal_ultimo_alerta = eirox_ultimo_preco_principal_por_ean(base_principal_alerta)
+            _qtd_principal_alerta = (
+                base_principal_alerta.dropna(subset=["EAN", "Preço (R$)"])
+                .groupby("EAN")["Preço (R$)"].count().to_dict()
             )
+            principal = pd.DataFrame({
+                "EAN": _principal_ultimo_alerta["EAN"],
+                "Produto_Pesquisa": _principal_ultimo_alerta["Produto"] if "Produto" in _principal_ultimo_alerta.columns else "",
+                "Preco_Principal": pd.to_numeric(_principal_ultimo_alerta["Preço (R$)"], errors="coerce"),
+                "Qtd_Pesquisas_Principal": _principal_ultimo_alerta["EAN"].map(_qtd_principal_alerta).fillna(1),
+                "Farmacia_Principal": _principal_ultimo_alerta["Farmácia"] if "Farmácia" in _principal_ultimo_alerta.columns else "",
+                "Rede_Principal": _principal_ultimo_alerta["Rede"] if "Rede" in _principal_ultimo_alerta.columns else "",
+            }) if not _principal_ultimo_alerta.empty else pd.DataFrame()
 
             concorrentes_validos = (
                 base_concorrente_alerta
@@ -27237,11 +32088,742 @@ if pagina == "🚨 Central de Alertas":
 
 
 
+def eirox_v160_motor_rentabilidade(base, margem_alvo_pct=20.0):
+    """
+    Motor de Rentabilidade do Dashboard Geral.
+
+    Usa a mesma fonte financeira central do Pricing:
+    - preço atual oficial;
+    - custo unitário;
+    - referência competitiva de mercado;
+    - volume do último mês fechado com venda por EAN.
+
+    Não altera a recomendação oficial do Pricing. É uma visão analítica
+    específica para rentabilidade.
+    """
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return pd.DataFrame()
+
+    alvo = float(margem_alvo_pct) / 100.0
+    alvo = min(max(alvo, 0.01), 0.95)
+
+    motor = eirox_motor_oportunidades(base.copy())
+    if not isinstance(motor, pd.DataFrame) or motor.empty:
+        return pd.DataFrame()
+
+    c_ean = _eirox_first_col(motor, ["EAN","EAN (GTIN)","GTIN"])
+    c_prod = _eirox_first_col(motor, ["Produto","Descrição","Descricao","Produto na Pesquisa"])
+    c_lab = _eirox_first_col(motor, ["Laboratório","Laboratorio","Fabricante","Fornecedor"])
+    if not c_ean:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(index=motor.index)
+    out["EAN"] = _ean(motor[c_ean])
+    out["Produto"] = motor[c_prod].astype(str) if c_prod else ""
+    out["Laboratório"] = motor[c_lab].astype(str) if c_lab else ""
+
+    out["Preço Atual"] = pd.to_numeric(motor["Preço_Atual_Eirox"], errors="coerce")
+    out["Custo Unitário"] = pd.to_numeric(motor["Custo_Unitario_Eirox"], errors="coerce")
+    out["Preço Mercado"] = pd.to_numeric(motor["Preço_Mercado_Eirox"], errors="coerce")
+
+    p = out["Preço Atual"]
+    c = out["Custo Unitário"]
+    m = out["Preço Mercado"]
+
+    out["Margem Atual %"] = np.where(
+        p.gt(0) & c.notna(),
+        ((p-c)/p)*100,
+        np.nan
+    )
+    out["Margem Mercado %"] = np.where(
+        m.gt(0) & c.notna(),
+        ((m-c)/m)*100,
+        np.nan
+    )
+
+    out["Preço p/ Margem Alvo"] = np.where(
+        c.notna() & c.gt(0),
+        c / (1.0-alvo),
+        np.nan
+    )
+
+    preco_alvo = pd.to_numeric(out["Preço p/ Margem Alvo"], errors="coerce")
+
+    # Volume oficial do último mês fechado por EAN.
+    fechado = eirox_v158_ultimo_mes_fechado_memoria(
+        globals().get("venda_rede", pd.DataFrame())
+    )
+    if isinstance(fechado, pd.DataFrame) and not fechado.empty:
+        fechado = fechado[[
+            "EAN","Itens_Mes_Fechado","Venda_Mes_Fechado","Mes_Fechado_Referencia"
+        ]].drop_duplicates("EAN", keep="last").copy()
+        fechado["EAN"] = _ean(fechado["EAN"])
+        out = out.merge(fechado, on="EAN", how="left")
+    else:
+        out["Itens_Mes_Fechado"] = np.nan
+        out["Venda_Mes_Fechado"] = np.nan
+        out["Mes_Fechado_Referencia"] = ""
+
+    q = pd.to_numeric(out["Itens_Mes_Fechado"], errors="coerce").fillna(0)
+
+    # Diagnóstico de rentabilidade.
+    status = pd.Series("RENTABILIDADE OK", index=out.index, dtype=object)
+
+    sem_custo = c.isna() | c.le(0)
+    sem_preco = p.isna() | p.le(0)
+    sem_mercado = m.isna() | m.le(0)
+    margem_atual = pd.to_numeric(out["Margem Atual %"], errors="coerce") / 100.0
+
+    status.loc[sem_custo] = "SEM CUSTO"
+    status.loc[~sem_custo & sem_preco] = "SEM PREÇO"
+    status.loc[~sem_custo & ~sem_preco & sem_mercado & margem_atual.lt(alvo)] = "REVISAR MERCADO"
+
+    pode_preco = (
+        ~sem_custo & ~sem_preco & ~sem_mercado
+        & margem_atual.lt(alvo)
+        & preco_alvo.gt(p)
+        & preco_alvo.le(m)
+    )
+    precisa_custo = (
+        ~sem_custo & ~sem_preco & ~sem_mercado
+        & margem_atual.lt(alvo)
+        & preco_alvo.gt(m)
+    )
+    status.loc[pode_preco] = "AJUSTAR PREÇO"
+    status.loc[precisa_custo] = "NEGOCIAR CUSTO"
+
+    out["Ação Rentabilidade"] = status
+
+    # Preço recomendado no motor de rentabilidade.
+    out["Preço Recomendado Rentabilidade"] = p.astype("float64")
+    out.loc[pode_preco, "Preço Recomendado Rentabilidade"] = preco_alvo[pode_preco]
+    # Quando a meta não cabe no mercado, mostra o teto competitivo como referência.
+    out.loc[precisa_custo, "Preço Recomendado Rentabilidade"] = m[precisa_custo]
+
+    pr = pd.to_numeric(out["Preço Recomendado Rentabilidade"], errors="coerce")
+    out["Aumento Unitário Rentabilidade"] = (pr-p).clip(lower=0).round(2)
+    out["Potencial por Preço"] = (
+        out["Aumento Unitário Rentabilidade"] * q
+    ).round(2)
+
+    # Custo máximo para atingir a meta no preço competitivo.
+    out["Custo Máximo p/ Meta"] = np.where(
+        m.gt(0),
+        m * (1.0-alvo),
+        np.nan
+    )
+    custo_max = pd.to_numeric(out["Custo Máximo p/ Meta"], errors="coerce")
+    out["Redução Custo Necessária"] = (
+        c - custo_max
+    ).clip(lower=0).round(2)
+
+    # Só é redução necessária quando a meta não cabe no preço de mercado.
+    out.loc[~precisa_custo, "Redução Custo Necessária"] = 0.0
+    out["Potencial por Custo"] = (
+        out["Redução Custo Necessária"] * q
+    ).round(2)
+
+    out["Margem Alvo %"] = float(margem_alvo_pct)
+    out["Qtd Último Mês Fechado"] = q
+    out["Venda Último Mês Fechado"] = pd.to_numeric(
+        out["Venda_Mes_Fechado"], errors="coerce"
+    )
+
+    # Gap em pontos percentuais para a meta.
+    out["Gap Margem p.p."] = (
+        float(margem_alvo_pct) -
+        pd.to_numeric(out["Margem Atual %"], errors="coerce")
+    ).clip(lower=0)
+
+    ordem = {
+        "NEGOCIAR CUSTO": 1,
+        "AJUSTAR PREÇO": 2,
+        "REVISAR MERCADO": 3,
+        "SEM CUSTO": 4,
+        "SEM PREÇO": 5,
+        "RENTABILIDADE OK": 6,
+    }
+    out["__ordem"] = out["Ação Rentabilidade"].map(ordem).fillna(99)
+    out = out.sort_values(
+        ["__ordem","Gap Margem p.p.","Potencial por Preço","Potencial por Custo"],
+        ascending=[True,False,False,False],
+        kind="stable"
+    ).drop(columns=["__ordem"])
+
+    return out.reset_index(drop=True)
+
+
+def eirox_v160_render_motor_rentabilidade(base):
+    st.markdown(
+        """
+        <div class="eirox-hero">
+            <div class="eirox-section-title">Motor Financeiro</div>
+            <h1>📈 Motor de Rentabilidade</h1>
+            <p>Analisa margem atual, preço competitivo e necessidade de negociação de custo.</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    _margem_padrao_v160 = 20
+    try:
+        _raw_v160 = float(EIROX_MARGEM_MINIMA_PADRAO)
+        _margem_padrao_v160 = int(round(_raw_v160*100 if _raw_v160 <= 1 else _raw_v160))
+    except Exception:
+        pass
+    _margem_padrao_v160 = min(max(_margem_padrao_v160,5),60)
+
+    margem_alvo = st.slider(
+        "Margem alvo do motor",
+        min_value=5,
+        max_value=60,
+        value=_margem_padrao_v160,
+        step=1,
+        format="%d%%",
+        key="eirox_motor_rentabilidade_margem_v160"
+    )
+
+    rent = eirox_v160_motor_rentabilidade(base, margem_alvo)
+    if not isinstance(rent, pd.DataFrame) or rent.empty:
+        st.info("Não há dados suficientes para calcular o motor de rentabilidade.")
+        return
+
+    margem_valida = pd.to_numeric(rent["Margem Atual %"], errors="coerce").dropna()
+    margem_media = float(margem_valida.mean()) if not margem_valida.empty else np.nan
+
+    abaixo = rent[
+        rent["Ação Rentabilidade"].isin(
+            ["AJUSTAR PREÇO","NEGOCIAR CUSTO","REVISAR MERCADO"]
+        )
+    ]
+    ajustar = rent[rent["Ação Rentabilidade"].eq("AJUSTAR PREÇO")]
+    negociar = rent[rent["Ação Rentabilidade"].eq("NEGOCIAR CUSTO")]
+
+    potencial_preco = pd.to_numeric(
+        ajustar["Potencial por Preço"], errors="coerce"
+    ).fillna(0).sum()
+    potencial_custo = pd.to_numeric(
+        negociar["Potencial por Custo"], errors="coerce"
+    ).fillna(0).sum()
+
+    k1,k2,k3,k4,k5 = st.columns(5)
+    k1.metric(
+        "Margem Média Atual",
+        percentual_br(margem_media) if pd.notna(margem_media) else "—"
+    )
+    k2.metric("Margem Alvo", f"{margem_alvo}%")
+    k3.metric("Produtos abaixo da meta", f"{len(abaixo):,}".replace(",", "."))
+    k4.metric("Potencial por Preço", moeda_br(potencial_preco))
+    k5.metric("Potencial por Custo", moeda_br(potencial_custo))
+
+    st.caption(
+        "Preço: oportunidade de captura ao ajustar até a margem alvo sem ultrapassar "
+        "a referência competitiva. Custo: redução necessária quando a margem alvo "
+        "não cabe no preço de mercado."
+    )
+
+    resumo = (
+        rent["Ação Rentabilidade"]
+        .value_counts()
+        .reindex([
+            "AJUSTAR PREÇO",
+            "NEGOCIAR CUSTO",
+            "RENTABILIDADE OK",
+            "REVISAR MERCADO",
+            "SEM CUSTO",
+            "SEM PREÇO",
+        ], fill_value=0)
+        .rename_axis("Situação")
+        .reset_index(name="Produtos")
+    )
+    eirox_dataframe_brl(resumo, use_container_width=True, hide_index=True)
+
+    st.markdown("### Produtos e oportunidades de rentabilidade")
+
+    _filtro_acao_v160 = st.multiselect(
+        "Filtrar situação",
+        resumo.loc[resumo["Produtos"].gt(0),"Situação"].tolist(),
+        default=[],
+        key="eirox_motor_rentabilidade_filtro_v160"
+    )
+    tabela = rent.copy()
+    if _filtro_acao_v160:
+        tabela = tabela[tabela["Ação Rentabilidade"].isin(_filtro_acao_v160)].copy()
+
+    exibir = tabela[[
+        c for c in [
+            "EAN","Produto","Laboratório","Ação Rentabilidade",
+            "Margem Atual %","Margem Alvo %","Gap Margem p.p.",
+            "Preço Atual","Custo Unitário","Preço Mercado",
+            "Preço p/ Margem Alvo","Preço Recomendado Rentabilidade",
+            "Qtd Último Mês Fechado","Mes_Fechado_Referencia",
+            "Potencial por Preço","Redução Custo Necessária",
+            "Potencial por Custo"
+        ] if c in tabela.columns
+    ]].copy()
+
+    for cmoeda in [
+        "Preço Atual","Custo Unitário","Preço Mercado","Preço p/ Margem Alvo",
+        "Preço Recomendado Rentabilidade","Potencial por Preço",
+        "Redução Custo Necessária","Potencial por Custo"
+    ]:
+        if cmoeda in exibir.columns:
+            exibir[cmoeda] = exibir[cmoeda].apply(moeda_br)
+
+    for cpct in ["Margem Atual %","Margem Alvo %","Gap Margem p.p."]:
+        if cpct in exibir.columns:
+            exibir[cpct] = pd.to_numeric(exibir[cpct], errors="coerce").apply(
+                lambda v: f"{v:.2f}%".replace(".", ",") if pd.notna(v) else ""
+            )
+
+    if "Qtd Último Mês Fechado" in exibir.columns:
+        exibir["Qtd Último Mês Fechado"] = pd.to_numeric(
+            exibir["Qtd Último Mês Fechado"], errors="coerce"
+        ).fillna(0).round(0).astype(int)
+
+    exibir = exibir.replace(
+        {"None":"","nan":"","NaN":"","R$ nan":"","nan%":""}
+    ).fillna("")
+
+    eirox_dataframe_brl(
+        exibir,
+        use_container_width=True,
+        hide_index=True,
+        height=560
+    )
+
+    _xlsx_v160 = eirox_excel_padrao_bytes(
+        exibir,
+        titulo=f"Motor de Rentabilidade - Meta {margem_alvo}%",
+        nome_aba="Rentabilidade"
+    )
+    st.download_button(
+        "📊 Exportar Motor de Rentabilidade",
+        _xlsx_v160,
+        f"motor_rentabilidade_meta_{margem_alvo}.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="eirox_motor_rentabilidade_excel_v160",
+        use_container_width=True,
+        disabled=not bool(_xlsx_v160)
+    )
+
 # ================================================================
 # V1.4.22 — DASHBOARD GERAL / APRESENTAÇÃO COMERCIAL PREMIUM
 # Alteração exclusivamente visual. Não altera DataFrames, regras, filtros,
 # cálculos, recomendações, exportações ou fontes de dados.
 # ================================================================
+# ================================================================
+# EIROX PRICING 2.0 — FASE 3
+# ÍNDICE EXECUTIVO + QUALIDADE DE DADOS SEPARADA
+# ================================================================
+# Regra preservada:
+# Índice Eirox = (Rentabilidade Atual × 60%)
+#              + ((Potencial de Captura ÷ 1.000) × 40%)
+#
+# A qualidade dos dados NÃO altera matematicamente o índice.
+# Ela é exibida separadamente e determina apenas se a leitura é consolidada
+# ou provisória, preservando o critério já existente de 60% de completude.
+try:
+    _eirox_margem_indice_v161 = 0.0
+    _eirox_potencial_indice_v161 = 0.0
+    _eirox_indice_v161 = 0
+    _eirox_indice_tem_margem_v230 = False
+    _eirox_indice_tem_potencial_v230 = False
+
+    # Rentabilidade: usa primeiro a camada oficial da Fase 2.
+    if "Margem_Oficial_%" in df_filtrado.columns:
+        _serie_margem_v230 = pd.to_numeric(
+            df_filtrado["Margem_Oficial_%"], errors="coerce"
+        ).replace([np.inf, -np.inf], np.nan).dropna()
+    else:
+        _serie_margem_v230 = pd.Series(dtype="float64")
+
+    # Compatibilidade com snapshots antigos: Margem_% pode estar em fração
+    # ou percentual. Só normaliza quando a escala é inequivocamente fracionária.
+    if _serie_margem_v230.empty and "Margem_%" in df_filtrado.columns:
+        _serie_margem_v230 = pd.to_numeric(
+            df_filtrado["Margem_%"], errors="coerce"
+        ).replace([np.inf, -np.inf], np.nan).dropna()
+        if not _serie_margem_v230.empty:
+            _med_abs_v230 = float(_serie_margem_v230.abs().median())
+            if _med_abs_v230 <= 1.5:
+                _serie_margem_v230 = _serie_margem_v230 * 100.0
+
+    if not _serie_margem_v230.empty:
+        _eirox_margem_indice_v161 = float(_serie_margem_v230.mean())
+        _eirox_indice_tem_margem_v230 = True
+
+    # Potencial: continua vindo do simulador unificado.
+    # Não há fallback para Ganho_Potencial histórico, evitando inflar o índice
+    # com valores antigos quando o simulador atual não consegue calcular.
+    try:
+        _sim_indice_v161 = eirox_v159_simulacao_unificada(df_filtrado.copy())
+        if isinstance(_sim_indice_v161, pd.DataFrame) and not _sim_indice_v161.empty:
+            _c_ganho_v230 = (
+                "Ganho_Potencial_Simulador"
+                if "Ganho_Potencial_Simulador" in _sim_indice_v161.columns
+                else None
+            )
+            if _c_ganho_v230:
+                _ganhos_v230 = pd.to_numeric(
+                    _sim_indice_v161[_c_ganho_v230], errors="coerce"
+                ).replace([np.inf, -np.inf], np.nan).fillna(0)
+                _eirox_potencial_indice_v161 = float(_ganhos_v230.sum())
+                _eirox_indice_tem_potencial_v230 = True
+    except Exception:
+        _sim_indice_v161 = pd.DataFrame()
+
+    _eirox_indice_v161 = round(
+        (_eirox_margem_indice_v161 * 0.60)
+        + ((_eirox_potencial_indice_v161 / 1000.0) * 0.40)
+    )
+
+    if _eirox_indice_v161 >= 70:
+        _eirox_faixa_indice_v161 = "🟢 Alta oportunidade"
+        _eirox_flag_indice_v162 = "🟢 ÍNDICE ALTO"
+        _eirox_flag_classe_v162 = "alto"
+    elif _eirox_indice_v161 >= 40:
+        _eirox_faixa_indice_v161 = "🟡 Oportunidade relevante"
+        _eirox_flag_indice_v162 = "🟡 ÍNDICE MÉDIO"
+        _eirox_flag_classe_v162 = "medio"
+    else:
+        _eirox_faixa_indice_v161 = "🔴 Baixo impacto"
+        _eirox_flag_indice_v162 = "🔴 ÍNDICE BAIXO"
+        _eirox_flag_classe_v162 = "baixo"
+
+except Exception:
+    _eirox_margem_indice_v161 = 0.0
+    _eirox_potencial_indice_v161 = 0.0
+    _eirox_indice_v161 = 0
+    _eirox_indice_tem_margem_v230 = False
+    _eirox_indice_tem_potencial_v230 = False
+    _eirox_faixa_indice_v161 = "⚪ Não calculado"
+    _eirox_flag_indice_v162 = "⚪ ÍNDICE NÃO CALCULADO"
+    _eirox_flag_classe_v162 = "nao_calculado"
+
+
+# Auditoria executiva da Fase 3 usando SOMENTE a camada oficial da Fase 2.
+_q_total_v230 = 0
+_q_completo_v230 = 0
+_q_sem_preco_v230 = 0
+_q_sem_custo_v230 = 0
+_q_sem_mercado_v230 = 0
+_q_sem_volume_v230 = 0
+_q_apto_margem_v230 = 0
+_q_apto_potencial_v230 = 0
+_confiabilidade_v230 = 0.0
+_cobertura_media_v230 = 0.0
+_faturamento_bloqueado_v230 = 0.0
+_produtos_bloqueados_v230 = 0
+_qualidade_flag_v230 = "🔴 Base com pendências relevantes"
+_flag_exibicao_v230 = _eirox_flag_indice_v162
+_q_base_v230 = pd.DataFrame()
+
+try:
+    _q_base_v230 = df_filtrado.copy()
+    _c_ean_v230 = _eirox_first_col(
+        _q_base_v230,
+        ["EAN_Oficial", "EAN", "EAN (GTIN)", "GTIN", "Código de Barras"]
+    )
+    if _c_ean_v230:
+        _q_base_v230["__EAN_V230"] = eirox_v210_normalizar_ean(
+            _q_base_v230[_c_ean_v230]
+        )
+    else:
+        _q_base_v230["__EAN_V230"] = _q_base_v230.index.astype(str)
+
+    # Um registro executivo por EAN para não duplicar cobertura/faturamento.
+    _q_base_v230 = (
+        _q_base_v230
+        .sort_index(kind="stable")
+        .drop_duplicates("__EAN_V230", keep="first")
+        .reset_index(drop=True)
+    )
+
+    _preco_v230 = pd.to_numeric(
+        _q_base_v230.get("Preco_Atual_Oficial", np.nan), errors="coerce"
+    )
+    _custo_v230 = pd.to_numeric(
+        _q_base_v230.get("Custo_Oficial", np.nan), errors="coerce"
+    )
+    _mercado_v230 = pd.to_numeric(
+        _q_base_v230.get("Preco_Mercado_Oficial", np.nan), errors="coerce"
+    )
+    _volume_v230 = pd.to_numeric(
+        _q_base_v230.get("Volume_Oficial", np.nan), errors="coerce"
+    )
+    _fat_v230 = pd.to_numeric(
+        _q_base_v230.get("Faturamento_Mes_Oficial", np.nan), errors="coerce"
+    ).fillna(0)
+
+    _ok_preco_v230 = _preco_v230.notna() & _preco_v230.gt(0)
+    _ok_custo_v230 = _custo_v230.notna() & _custo_v230.gt(0)
+    _ok_mercado_v230 = _mercado_v230.notna() & _mercado_v230.gt(0)
+    _ok_volume_v230 = _volume_v230.notna() & _volume_v230.gt(0)
+    _ok_completo_v230 = (
+        _ok_preco_v230 & _ok_custo_v230 & _ok_mercado_v230 & _ok_volume_v230
+    )
+
+    _q_total_v230 = int(len(_q_base_v230))
+    _q_completo_v230 = int(_ok_completo_v230.sum())
+    _q_sem_preco_v230 = int((~_ok_preco_v230).sum())
+    _q_sem_custo_v230 = int((~_ok_custo_v230).sum())
+    _q_sem_mercado_v230 = int((~_ok_mercado_v230).sum())
+    _q_sem_volume_v230 = int((~_ok_volume_v230).sum())
+    _q_apto_margem_v230 = int((_ok_preco_v230 & _ok_custo_v230).sum())
+    _q_apto_potencial_v230 = int(
+        (_ok_preco_v230 & _ok_mercado_v230 & _ok_volume_v230).sum()
+    )
+
+    _confiabilidade_v230 = (
+        (_q_completo_v230 / _q_total_v230) * 100.0
+        if _q_total_v230 else 0.0
+    )
+
+    if "Cobertura_Dado_Oficial_%" in _q_base_v230.columns:
+        _cov_v230 = pd.to_numeric(
+            _q_base_v230["Cobertura_Dado_Oficial_%"], errors="coerce"
+        ).dropna()
+        if not _cov_v230.empty:
+            _cobertura_media_v230 = float(_cov_v230.mean())
+    else:
+        _cobertura_media_v230 = (
+            (
+                _ok_preco_v230.astype(int)
+                + _ok_custo_v230.astype(int)
+                + _ok_mercado_v230.astype(int)
+                + _ok_volume_v230.astype(int)
+            ).mean() * 25.0
+            if _q_total_v230 else 0.0
+        )
+
+    _mask_bloq_v230 = ~_ok_completo_v230
+    _produtos_bloqueados_v230 = int(_mask_bloq_v230.sum())
+    _faturamento_bloqueado_v230 = float(_fat_v230.loc[_mask_bloq_v230].sum())
+
+    # Mesmas faixas de qualidade já utilizadas anteriormente.
+    if _confiabilidade_v230 >= 90:
+        _qualidade_flag_v230 = "🟢 Base muito completa"
+    elif _confiabilidade_v230 >= 70:
+        _qualidade_flag_v230 = "🟡 Base parcialmente completa"
+    else:
+        _qualidade_flag_v230 = "🔴 Base com pendências relevantes"
+
+    # Critério histórico preservado: abaixo de 60% o índice é provisório.
+    if _confiabilidade_v230 < 60:
+        _flag_exibicao_v230 = "⚪ ÍNDICE PROVISÓRIO — BASE INSUFICIENTE"
+
+except Exception:
+    _qualidade_flag_v230 = "🔴 Qualidade não auditada"
+    _flag_exibicao_v230 = "⚪ ÍNDICE PROVISÓRIO — QUALIDADE NÃO AUDITADA"
+
+
+# Dashboard Geral com as três visões existentes.
+_eirox_visao_dashboard_v160 = st.radio(
+    "Visão do Dashboard",
+    ["📊 Visão Executiva", "📈 Motor de Rentabilidade", "🤖 Índice Eirox Calculado"],
+    horizontal=True,
+    key="eirox_visao_dashboard_v160",
+    label_visibility="collapsed"
+)
+
+if _eirox_visao_dashboard_v160 == "📈 Motor de Rentabilidade":
+    eirox_v160_render_motor_rentabilidade(df_filtrado.copy())
+    st.stop()
+
+if _eirox_visao_dashboard_v160 == "🤖 Índice Eirox Calculado":
+    _txt_margem_v230 = (
+        f"{_eirox_margem_indice_v161:.2f}%".replace(".", ",")
+        if _eirox_indice_tem_margem_v230
+        else "Dados insuficientes"
+    )
+    _txt_potencial_v230 = (
+        moeda_br(_eirox_potencial_indice_v161)
+        if _eirox_indice_tem_potencial_v230
+        else "Não calculado"
+    )
+
+    st.markdown(
+        f"""
+        <div style="
+            border:1px solid rgba(117,73,191,.72);
+            border-radius:22px;
+            padding:24px 26px;
+            margin-top:10px;
+            background:
+                radial-gradient(circle at 92% 18%, rgba(174,88,255,.16), transparent 32%),
+                linear-gradient(135deg,#151b3f 0%,#0c1f39 100%);
+            box-shadow:0 8px 22px rgba(0,0,0,.16);
+        ">
+            <div style="font-size:12px;font-weight:800;letter-spacing:.12em;color:#bda8ff;text-transform:uppercase;">
+                Índice Executivo Eirox
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:20px;margin-top:8px;">
+                <div>
+                    <div style="font-size:28px;font-weight:900;color:#f5f8ff;">🤖 Performance Comercial</div>
+                    <div style="margin-top:8px;color:#91a8c2;font-size:13px;">
+                        60% Rentabilidade Atual + 40% Potencial de Captura
+                    </div>
+                    <div style="margin-top:10px;color:#cbd7e6;font-size:12px;">
+                        Qualidade é auditada separadamente e não altera o cálculo do índice.
+                    </div>
+                </div>
+                <div style="text-align:right;">
+                    <div style="font-size:46px;font-weight:950;color:#d8c2ff;line-height:1;">{_eirox_indice_v161}</div>
+                    <div style="
+                        display:inline-block;margin-top:10px;padding:6px 12px;border-radius:999px;
+                        background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.10);
+                        color:#f5f8ff;font-size:12px;font-weight:850;
+                    ">{_flag_exibicao_v230}</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.markdown("### Performance comercial")
+    c_perf1, c_perf2, c_perf3 = st.columns(3)
+    c_perf1.metric("Rentabilidade Atual", _txt_margem_v230)
+    c_perf2.metric("Potencial de Captura", _txt_potencial_v230)
+    c_perf3.metric("Índice Eirox", _eirox_indice_v161)
+
+    st.markdown("### Qualidade e confiabilidade dos dados")
+    c_q1, c_q2, c_q3, c_q4 = st.columns(4)
+    c_q1.metric(
+        "Produtos completos",
+        f"{_q_completo_v230:,} / {_q_total_v230:,}".replace(",", ".")
+        if _q_total_v230 else "Sem base"
+    )
+    c_q2.metric(
+        "Confiabilidade",
+        f"{_confiabilidade_v230:.1f}%".replace(".", ",")
+        if _q_total_v230 else "Não auditada"
+    )
+    c_q3.metric(
+        "Cobertura média",
+        f"{_cobertura_media_v230:.1f}%".replace(".", ",")
+        if _q_total_v230 else "Não auditada"
+    )
+    c_q4.metric(
+        "Faturamento com pendência",
+        moeda_br(_faturamento_bloqueado_v230)
+    )
+
+    st.caption(
+        f"{_qualidade_flag_v230} • "
+        f"{_produtos_bloqueados_v230:,} produtos possuem ao menos uma pendência."
+        .replace(",", ".")
+    )
+
+    _pendencias_v230 = pd.DataFrame([
+        {"Pendência": "Sem preço atual oficial", "Produtos": _q_sem_preco_v230},
+        {"Pendência": "Sem custo oficial", "Produtos": _q_sem_custo_v230},
+        {"Pendência": "Sem referência oficial de mercado", "Produtos": _q_sem_mercado_v230},
+        {"Pendência": "Sem volume no último mês fechado", "Produtos": _q_sem_volume_v230},
+    ])
+    _pendencias_v230 = _pendencias_v230[_pendencias_v230["Produtos"].gt(0)].copy()
+
+    if _pendencias_v230.empty:
+        st.success("✅ Todos os produtos desta seleção possuem os quatro pilares oficiais.")
+    else:
+        st.warning(
+            "As pendências abaixo não alteram artificialmente o Índice Eirox; "
+            "elas determinam a confiabilidade da leitura."
+        )
+        eirox_dataframe_brl(
+            _pendencias_v230,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    with st.expander("🔎 Produtos com dados incompletos", expanded=False):
+        try:
+            if isinstance(_q_base_v230, pd.DataFrame) and not _q_base_v230.empty:
+                _det_v230 = _q_base_v230.copy()
+                if "Status_Dado_Oficial" in _det_v230.columns:
+                    _det_v230 = _det_v230[
+                        _det_v230["Status_Dado_Oficial"].astype(str).ne("COMPLETO")
+                    ].copy()
+
+                _cols_v230 = []
+                for _c in [
+                    "__EAN_V230", "Produto", "Pendencias_Dado_Oficial",
+                    "Preco_Atual_Oficial", "Fonte_Preco_Oficial",
+                    "Custo_Oficial", "Fonte_Custo_Oficial_2_0",
+                    "Preco_Mercado_Oficial", "Loja_Mercado_Oficial",
+                    "Data_Mercado_Oficial", "Volume_Oficial",
+                    "Mes_Volume_Oficial", "Faturamento_Mes_Oficial",
+                    "Cobertura_Dado_Oficial_%"
+                ]:
+                    if _c in _det_v230.columns:
+                        _cols_v230.append(_c)
+
+                if _cols_v230 and not _det_v230.empty:
+                    _det_v230 = _det_v230[_cols_v230].rename(
+                        columns={"__EAN_V230": "EAN"}
+                    )
+                    eirox_dataframe_brl(
+                        _det_v230,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=420
+                    )
+                else:
+                    st.success("Nenhuma pendência nesta seleção.")
+        except Exception:
+            st.caption("Detalhamento indisponível para esta seleção.")
+
+    st.markdown("### Composição do Índice")
+    if _eirox_indice_tem_margem_v230:
+        st.markdown(
+            f"**Rentabilidade Atual × 60%**  \n"
+            f"{_eirox_margem_indice_v161:.2f}% × 60% = "
+            f"**{(_eirox_margem_indice_v161 * 0.60):.2f}**"
+        )
+    else:
+        st.info("Não há rentabilidade oficial suficiente para explicar esta parcela.")
+
+    if _eirox_indice_tem_potencial_v230:
+        st.markdown(
+            f"**Potencial de Captura ÷ 1.000 × 40%**  \n"
+            f"{moeda_br(_eirox_potencial_indice_v161)} ÷ 1.000 × 40% = "
+            f"**{((_eirox_potencial_indice_v161 / 1000.0) * 0.40):.2f}**"
+        )
+    else:
+        st.info(
+            "O simulador unificado não encontrou oportunidade financeira válida "
+            "para esta base/filtro."
+        )
+
+    st.markdown(
+        f"""
+### Resultado executivo
+
+**Índice Eirox = {_eirox_indice_v161}**
+
+**Performance = {_eirox_flag_indice_v162}**
+
+**Leitura apresentada = {_flag_exibicao_v230}**
+
+**Qualidade da base = {_qualidade_flag_v230} ({_confiabilidade_v230:.1f}%)**
+
+A fórmula histórica do Índice Eirox foi preservada. A qualidade dos dados é
+mostrada separadamente e **não multiplica, reduz ou aumenta o índice**.
+
+Faixas de performance preservadas:
+
+- 🟢 **70 ou mais:** Índice Alto
+- 🟡 **40 a 69:** Índice Médio
+- 🔴 **Abaixo de 40:** Índice Baixo
+
+Quando menos de 60% dos produtos possuem preço, custo, mercado e volume oficiais,
+a leitura permanece visível para auditoria, mas é identificada como **provisória**.
+        """
+    )
+    st.stop()
+
+
 try:
     _eirox_rede_dash = (
         eirox_nome_rede_principal()
@@ -27451,17 +33033,9 @@ st.markdown(
 # Aviso técnico quando o simulador estiver usando fallback do histórico
 if origem_simulacao_global == "historico_pesquisa":
     st.info(
-        "ℹ️ O simulador operacional está usando o histórico de pesquisa como apoio, "
-        "mas o Ganho Potencial exibido no dashboard permanece o valor oficial da Analise_Pricing.xlsx."
+        "ℹ️ O simulador operacional está usando o histórico de pesquisa como apoio. "
+        "O Potencial de Captura do Dashboard é recalculado pelo mesmo motor da tela SUBIR PREÇO."
     )
-
-
-if "origem_simulacao_global" in globals():
-    if origem_simulacao_global == "venda_rede_historico_inteligente":
-        pass
-
-    else:
-        st.info("ℹ️ Motor inteligente sem base completa. Usando Ganho_Potencial oficial da Analise_Pricing.xlsx.")
 
 if "Ganho_Potencial" in df_filtrado.columns:
     ganho_total_atualizado = pd.to_numeric(
@@ -27470,6 +33044,36 @@ if "Ganho_Potencial" in df_filtrado.columns:
     ).fillna(0).sum()
 else:
     ganho_total_atualizado = 0
+
+# V1.4.59 — uma única população financeira para todas as visões.
+try:
+    simulacao_global = eirox_v159_simulacao_unificada(df_filtrado.copy())
+    origem_simulacao_global = "motor_subir_preco_unificado"
+except Exception:
+    simulacao_global = pd.DataFrame()
+    origem_simulacao_global = "erro_unificacao_v159"
+
+# V1.4.52 — auditoria financeira, sem alterar os filtros ou o motor.
+with st.expander("🔎 Auditoria financeira — conferir ganhos", expanded=False):
+    st.caption("Compara os ganhos registrados com o preço atual exibido. "
+               "Não soma ações diferentes nem substitui dados ausentes por estimativas.")
+    try:
+        _aud_v152, _res_v152 = eirox_v152_auditoria_financeira(df_filtrado)
+        if not _res_v152.empty:
+            eirox_dataframe_brl(_res_v152, use_container_width=True, hide_index=True)
+            _div_v152 = _aud_v152[
+                _aud_v152["Situação"].ne("OK") | _aud_v152["Duplicidade EAN"]
+            ]
+            st.caption(f"Registros para conferência: {len(_div_v152):,}".replace(",", "."))
+            if not _div_v152.empty:
+                eirox_dataframe_brl(_div_v152, use_container_width=True, hide_index=True)
+            st.download_button(
+                "📥 Baixar auditoria CSV",
+                _aud_v152.to_csv(index=False,sep=";",decimal=",").encode("utf-8-sig"),
+                "auditoria_financeira.csv","text/csv",key="auditoria_v152_csv"
+            )
+    except Exception as _erro_aud_v152:
+        st.warning("A auditoria não pôde ser concluída. Consulte os logs para conferir a origem dos dados.")
 
 # --------------------------------------------------
 # KPIS
@@ -27480,7 +33084,21 @@ else:
 _eirox_kpi_pesquisas = quantidade_pesquisas_card(historico, df_filtrado)
 _eirox_kpi_rentabilidade = percentual_br(df_filtrado["Margem_%"].mean())
 _eirox_kpi_lucro = moeda_br(df_filtrado["Lucro_Unitario"].mean())
-_eirox_kpi_potencial = moeda_br_kpi(df_filtrado["Ganho_Potencial"].sum())
+
+# V1.4.59 — Potencial de Captura = soma exata do Simulador/Subir Preço.
+try:
+    _potencial_kpi_v151 = (
+        pd.to_numeric(
+            simulacao_global["Ganho_Potencial_Simulador"], errors="coerce"
+        ).fillna(0).sum()
+        if isinstance(simulacao_global, pd.DataFrame)
+        and not simulacao_global.empty
+        else 0.0
+    )
+except Exception:
+    _potencial_kpi_v151 = 0.0
+
+_eirox_kpi_potencial = moeda_br_kpi(_potencial_kpi_v151)
 _eirox_kpi_labs = df_filtrado["Laboratório"].nunique()
 _eirox_kpi_preco = moeda_br(df_filtrado["Preco_Medio"].mean())
 
@@ -27488,7 +33106,7 @@ st.markdown(
     f"""
     <style>
     .eirox-kpi-grid-v1434 {{
-        display:grid; grid-template-columns:1fr 1fr 1fr 1.65fr 1fr 1fr;
+        display:grid; grid-template-columns:repeat(8,minmax(0,1fr));
         gap:14px; margin:4px 0 14px 0; align-items:stretch;
     }}
     .eirox-kpi-v1434 {{
@@ -27501,7 +33119,7 @@ st.markdown(
         content:''; position:absolute; left:0; top:0; right:0; height:3px;
         background:linear-gradient(90deg,#20b8ff,#2ed6bd); opacity:.95;
     }}
-    .eirox-kpi-v1434.main {{border-color:#7440bc; background:linear-gradient(145deg,#171c43,#151735);}}
+    .eirox-kpi-v1434.main {{border-color:#7440bc; grid-column:span 2; background:linear-gradient(145deg,#171c43,#151735);}}
     .eirox-kpi-v1434.main:before {{background:linear-gradient(90deg,#7b3cff,#b75cff);}}
     .eirox-kpi-head-v1434 {{display:flex;align-items:center;gap:10px;color:#c7daf0;font-size:13px;font-weight:650;white-space:nowrap;}}
     .eirox-kpi-icon-v1434 {{width:35px;height:35px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#123c67;font-size:18px;box-shadow:0 0 18px rgba(32,184,255,.18);flex:0 0 35px;}}
@@ -27512,6 +33130,17 @@ st.markdown(
     .eirox-kpi-v1434.warn .eirox-kpi-value-v1434 {{color:#ffc247;}}
     .eirox-kpi-v1434.blue .eirox-kpi-value-v1434 {{color:#55a8ff;}}
     .eirox-kpi-v1434.main .eirox-kpi-value-v1434 {{font-size:30px;}}
+    .eirox-kpi-v1434.index-eirox {{border-color:#7440bc;background:linear-gradient(145deg,#171c43,#151735);}}
+    .eirox-kpi-v1434.index-eirox:before {{background:linear-gradient(90deg,#7b3cff,#b75cff);}}
+    .eirox-kpi-v1434.index-eirox .eirox-kpi-icon-v1434 {{background:#5430a2;box-shadow:0 0 22px rgba(157,78,255,.28);}}
+    .eirox-kpi-v1434.index-eirox .eirox-kpi-value-v1434 {{color:#d8c2ff;font-size:30px;}}
+    .eirox-kpi-flag-v163 {{
+        display:inline-flex;align-items:center;justify-content:center;
+        margin-top:8px;padding:4px 8px;border-radius:999px;
+        font-size:10.5px;font-weight:850;letter-spacing:.03em;
+        background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.10);
+        color:#f5f8ff;white-space:nowrap;
+    }}
     .eirox-kpi-sub-v1434 {{font-size:11.5px;color:#8fa8c2;margin-top:9px;white-space:nowrap;}}
     @media(max-width:1200px) {{.eirox-kpi-grid-v1434{{grid-template-columns:repeat(3,1fr)}}}}
     </style>
@@ -27522,10 +33151,30 @@ st.markdown(
       <div class="eirox-kpi-v1434 main"><div class="eirox-kpi-head-v1434"><span class="eirox-kpi-icon-v1434">◎</span>POTENCIAL DE CAPTURA</div><div class="eirox-kpi-value-v1434">{_eirox_kpi_potencial}</div><div class="eirox-kpi-sub-v1434">oportunidade financeira identificada</div></div>
       <div class="eirox-kpi-v1434 warn"><div class="eirox-kpi-head-v1434"><span class="eirox-kpi-icon-v1434">♙</span>Laboratórios</div><div class="eirox-kpi-value-v1434">{_eirox_kpi_labs}</div><div class="eirox-kpi-sub-v1434">monitorados</div></div>
       <div class="eirox-kpi-v1434 blue"><div class="eirox-kpi-head-v1434"><span class="eirox-kpi-icon-v1434">◆</span>Preço Médio</div><div class="eirox-kpi-value-v1434">{_eirox_kpi_preco}</div><div class="eirox-kpi-sub-v1434">mercado analisado</div></div>
+      <div class="eirox-kpi-v1434 index-eirox"><div class="eirox-kpi-head-v1434"><span class="eirox-kpi-icon-v1434">🤖</span>Índice Eirox</div><div class="eirox-kpi-value-v1434">{_eirox_indice_v161}</div><div class="eirox-kpi-flag-v163">{_eirox_flag_indice_v162}</div></div>
     </div>
     """,
     unsafe_allow_html=True,
 )
+
+with st.expander("🎯 Entenda o Índice Eirox", expanded=False):
+    st.markdown(
+        f"""
+**Fórmula original preservada**
+
+**Índice Eirox = (Rentabilidade Atual × 60%) + ((Potencial de Captura ÷ 1.000) × 40%)**
+
+- Rentabilidade média usada: **{_eirox_margem_indice_v161:.2f}**
+- Potencial de Captura atual: **{moeda_br(_eirox_potencial_indice_v161)}**
+- Índice calculado: **{_eirox_indice_v161}**
+- Flag calculada: **{_eirox_flag_indice_v162}**
+
+Faixas:
+- 🟢 **70 pontos ou mais:** alta oportunidade.
+- 🟡 **De 40 a 69 pontos:** oportunidade relevante.
+- 🔴 **Abaixo de 40 pontos:** baixo impacto financeiro.
+        """
+    )
 
 explicacao_calculo(
     "Indicadores principais do Painel Geral",
@@ -27533,9 +33182,10 @@ explicacao_calculo(
         "Pesquisas = quantidade total de linhas válidas carregadas da pasta VENDA_TESTE.",
         "Margem Média = média da coluna Margem_% dos produtos filtrados.",
         "Lucro Médio = média da coluna Lucro_Unitario dos produtos filtrados.",
-        "Ganho Potencial = soma da coluna Ganho_Potencial dos produtos filtrados.",
+        "Potencial de Captura = soma do Ganho de Lucro Potencial das ações válidas de SUBIR PREÇO, usando o mesmo Preço Atual e a mesma quantidade da tela detalhada.",
         "Laboratórios = quantidade de laboratórios únicos após os filtros.",
-        "Preço Médio = média da coluna Preco_Medio dos produtos filtrados."
+        "Preço Médio = média da coluna Preco_Medio dos produtos filtrados.",
+        "Índice Eirox = 60% da Rentabilidade Atual + 40% do Potencial de Captura dividido por 1.000. Flag: verde para índice >= 70, amarela de 40 a 69 e vermelha abaixo de 40."
     ]
 )
 
@@ -27549,16 +33199,20 @@ with c1:
 
     df_filtrado = aplicar_engine_recomendacoes_restaurada(df_filtrado)
 
-    rec = (
+    _ordem_rec_v154 = [
+        "SUBIR PREÇO URGENTE",
+        "SUBIR PREÇO",
+        "MANTER",
+        "COMPETITIVO",
+        "ANALISAR REDUÇÃO",
+        "SEM CUSTO"
+    ]
+    _cont_rec_v154 = (
         df_filtrado["Recomendacao"]
         .value_counts()
-        .reset_index()
+        .reindex(_ordem_rec_v154, fill_value=0)
     )
-
-    rec.columns = [
-        "Recomendacao",
-        "Quantidade"
-    ]
+    rec = _cont_rec_v154.rename_axis("Recomendacao").reset_index(name="Quantidade")
 
     # Exibe todas as recomendações oficiais no gráfico.
     rec_grafico = rec.copy()
@@ -27714,370 +33368,157 @@ if "EAN" in produtos_recomendacao.columns:
         .str.strip()
     )
 
+
 # --------------------------------------------------
-# CRUZAR COM SIMULADOR PELO EAN
+# V1.4.56 — DETALHE DA RECOMENDAÇÃO PELA MESMA BASE DO RESUMO
 # --------------------------------------------------
+# O simulador passa a ser apenas uma fonte opcional de enriquecimento.
+# Nenhum produto contado no quadro de recomendações pode desaparecer por
+# ausência no simulador.
 
-if (
-    "simulacao_global" in globals()
-    and not simulacao_global.empty
-    and "EAN" in produtos_recomendacao.columns
-):
+produtos_detalhe = produtos_recomendacao.drop_duplicates(subset=["EAN"], keep="first").copy()
 
-    simulador_base = simulacao_global.copy()
+try:
+    if not produtos_detalhe.empty and "EAN" in produtos_detalhe.columns:
+        produtos_detalhe["EAN"] = _ean(produtos_detalhe["EAN"])
 
-    simulador_base["EAN"] = (
-        simulador_base["EAN"]
-        .astype(str)
-        .str.replace(".0", "", regex=False)
-        .str.strip()
-    )
+        # Motor central na MESMA população selecionada.
+        _motor_det_v156 = eirox_motor_oportunidades(produtos_recomendacao.copy())
+        if isinstance(_motor_det_v156, pd.DataFrame) and not _motor_det_v156.empty:
+            _ce_det_v156 = _eirox_first_col(_motor_det_v156, ["EAN","EAN (GTIN)","GTIN"])
+            if _ce_det_v156:
+                _motor_det_v156 = _motor_det_v156.copy()
+                _motor_det_v156["EAN"] = _ean(_motor_det_v156[_ce_det_v156])
+                _motor_det_v156 = _motor_det_v156.drop_duplicates("EAN", keep="first")
 
-    cadastro_produtos = (
-        produtos_recomendacao
-        .drop_duplicates(
-            subset=[
-                "EAN"
-            ]
-        )
-        .copy()
-    )
+                _fin_det_v156 = pd.DataFrame({
+                    "EAN": _motor_det_v156["EAN"],
+                    "Preco_Atual": pd.to_numeric(_motor_det_v156["Preço_Atual_Eirox"], errors="coerce"),
+                    "Preco_Sugerido_Mercado": pd.to_numeric(_motor_det_v156["Preço_Sugerido_Eirox"], errors="coerce"),
+                    "Custo": pd.to_numeric(_motor_det_v156["Custo_Unitario_Eirox"], errors="coerce"),
+                    "Qtd_Vendida_Motor": pd.to_numeric(_motor_det_v156["Qtd_Vendida_Eirox"], errors="coerce"),
+                    "Margem_Motor": pd.to_numeric(_motor_det_v156["Margem_Atual_Eirox"], errors="coerce"),
+                    "Ganho_Unitario": pd.to_numeric(_motor_det_v156["Ganho_Lucro_Unitario_Eirox"], errors="coerce"),
+                    "Ganho_Potencial_Simulador": pd.to_numeric(_motor_det_v156["Ganho_Lucro_Potencial_Eirox"], errors="coerce"),
+                })
 
-    colunas_cadastro = []
-
-    for coluna in [
-        "EAN",
-        "Descricao_Unica",
-        "Produto",
-                "Menor Preço Concorrente",
-                "Loja do Menor Preço",
-                "Data da Pesquisa",
-        "Laboratório",
-        "Família",
-        "CURVA",
-        "Recomendacao",
-        "Margem_%",
-        "Lucro_Unitario",
-        "Preco_Medio"
-    ]:
-
-        if coluna in cadastro_produtos.columns:
-            colunas_cadastro.append(coluna)
-
-    # V1.4.19 — detalhe deve preservar exatamente os produtos contados no resumo.
-    # A versão anterior usava o simulador como lado esquerdo + INNER JOIN,
-    # fazendo itens desaparecerem quando o EAN não existia no simulador.
-    # Agora a recomendação selecionada é a fonte principal e o simulador apenas
-    # enriquece os campos disponíveis, sem filtrar/reclassificar produto algum.
-    simulador_unico = simulador_base.drop_duplicates(subset=["EAN"], keep="first").copy()
-    _cols_sim_v1419 = [
-        c for c in simulador_unico.columns
-        if c == "EAN" or c not in cadastro_produtos.columns
-    ]
-    produtos_detalhe = cadastro_produtos[colunas_cadastro].merge(
-        simulador_unico[_cols_sim_v1419],
-        on="EAN",
-        how="left"
-    )
-
-    # --------------------------------------------------
-    # CUSTO UNITÁRIO PELA VENDA_FINAL_TESTE
-    # --------------------------------------------------
-    # Regra solicitada:
-    # Custo unitário = soma da coluna "Custo" / soma da coluna "Itens"
-    # A origem é a base venda_rede, carregada da pasta VENDA_FINAL_TESTE.
-
-    try:
-
-        if "Custo" not in produtos_detalhe.columns and isinstance(venda_rede, pd.DataFrame) and not venda_rede.empty:
-
-            base_custo_venda = venda_rede.copy()
-            base_custo_venda.columns = base_custo_venda.columns.astype(str).str.strip()
-
-            col_ean_custo = achar_coluna(
-                base_custo_venda,
-                [
-                    "EAN",
-                    "EAN (GTIN)",
-                    "GTIN",
-                    "Código de Barras",
-                    "Codigo de Barras",
-                    "Cód. Barras/Etiq.",
-                    "Cod. Barras/Etiq."
-                ],
-                [
-                    "ean",
-                    "gtin",
-                    "barras"
-                ]
-            )
-
-            col_custo_venda = achar_coluna(
-                base_custo_venda,
-                [
-                    "Custo",
-                    "CUSTO",
-                    "Valor Custo",
-                    "Custo Total",
-                    "CMV"
-                ],
-                [
-                    "custo",
-                    "cmv"
-                ]
-            )
-
-            col_itens_venda = achar_coluna(
-                base_custo_venda,
-                [
-                    "Itens",
-                    "Item",
-                    "Quantidade",
-                    "Qtd",
-                    "QTD",
-                    "Qtde",
-                    "Unidades"
-                ],
-                [
-                    "itens",
-                    "item",
-                    "qtd",
-                    "quant",
-                    "qtde",
-                    "unid"
-                ]
-            )
-
-            if col_ean_custo and col_custo_venda and col_itens_venda:
-
-                base_custo_venda["EAN"] = (
-                    base_custo_venda[col_ean_custo]
-                    .astype(str)
-                    .str.replace(".0", "", regex=False)
-                    .str.strip()
-                )
-
-                base_custo_venda["Custo_Total_Venda_Final"] = converter_numero_brasil(
-                    base_custo_venda[col_custo_venda]
-                )
-
-                base_custo_venda["Itens_Venda_Final"] = converter_numero_brasil(
-                    base_custo_venda[col_itens_venda]
-                )
-
-                custo_por_ean = (
-                    base_custo_venda
-                    .dropna(subset=["EAN", "Custo_Total_Venda_Final", "Itens_Venda_Final"])
-                    .groupby("EAN", as_index=False)
-                    .agg(
-                        Custo_Total_Venda_Final=("Custo_Total_Venda_Final", "sum"),
-                        Itens_Venda_Final=("Itens_Venda_Final", "sum")
+                if "Preço_Mercado_Eirox" in _motor_det_v156.columns:
+                    _fin_det_v156["Menor_Preco"] = pd.to_numeric(
+                        _motor_det_v156["Preço_Mercado_Eirox"], errors="coerce"
                     )
-                )
+                if "Menor Preço Concorrente" in _motor_det_v156.columns:
+                    _fin_det_v156["Menor Preço Concorrente"] = _motor_det_v156["Menor Preço Concorrente"]
+                if "Loja do Menor Preço" in _motor_det_v156.columns:
+                    _fin_det_v156["Loja do Menor Preço"] = _motor_det_v156["Loja do Menor Preço"]
+                    _fin_det_v156["Loja_Menor_Preco_Concorrente"] = _motor_det_v156["Loja do Menor Preço"]
+                if "Data da Pesquisa" in _motor_det_v156.columns:
+                    _fin_det_v156["Data da Pesquisa"] = _motor_det_v156["Data da Pesquisa"]
 
-                custo_por_ean = custo_por_ean[
-                    custo_por_ean["Itens_Venda_Final"] > 0
-                ].copy()
-
-                custo_por_ean["Custo"] = (
-                    custo_por_ean["Custo_Total_Venda_Final"]
-                    / custo_por_ean["Itens_Venda_Final"]
-                )
+                # Evita colisão com colunas cadastrais antigas.
+                _drop_det_v156 = [
+                    c for c in _fin_det_v156.columns
+                    if c != "EAN" and c in produtos_detalhe.columns
+                ]
+                if _drop_det_v156:
+                    produtos_detalhe = produtos_detalhe.drop(columns=_drop_det_v156)
 
                 produtos_detalhe = produtos_detalhe.merge(
-                    custo_por_ean[["EAN", "Custo"]],
-                    on="EAN",
-                    how="left"
+                    _fin_det_v156, on="EAN", how="left"
                 )
 
-    except Exception:
-        pass
-
-    # --------------------------------------------------
-    # MENOR PREÇO E LOJA COM MENOR PREÇO
-    # --------------------------------------------------
-
-    if (
-        not historico.empty
-        and "Preço (R$)" in historico.columns
-        and "Farmácia" in historico.columns
-    ):
-
-        hist_menor = historico.copy()
-
-        if "EAN" not in hist_menor.columns and "EAN (GTIN)" in hist_menor.columns:
-            hist_menor["EAN"] = hist_menor["EAN (GTIN)"]
-
-        if "EAN" in hist_menor.columns:
-
-            hist_menor["EAN"] = (
-                hist_menor["EAN"]
-                .astype(str)
-                .str.replace(".0", "", regex=False)
-                .str.strip()
-            )
-
-            hist_menor["Preço (R$)"] = pd.to_numeric(
-                hist_menor["Preço (R$)"],
-                errors="coerce"
-            )
-
-            hist_menor = hist_menor.dropna(
-                subset=[
-                    "EAN",
-                    "Preço (R$)"
-                ]
-            )
-
-            idx_menor_preco = (
-                hist_menor
-                .groupby("EAN")
-                ["Preço (R$)"]
-                .idxmin()
-            )
-
-            menor_preco_loja = (
-                hist_menor
-                .loc[
-                    idx_menor_preco,
-                    [
-                        "EAN",
-                        "Preço (R$)",
-                        "Farmácia"
-                    ]
-                ]
-                .rename(
-                    columns={
-                        "Preço (R$)": "Menor_Preco",
-                        "Farmácia": "Loja_Menor_Preco_Concorrente"
-                    }
-                )
-            )
-
+        # Último mês fechado com venda do EAN: volume e faturamento de referência.
+        _fechado_det_v156 = eirox_v146_ultimo_mes_fechado()
+        if isinstance(_fechado_det_v156, pd.DataFrame) and not _fechado_det_v156.empty:
+            _mes_det_v156 = _fechado_det_v156[[
+                "EAN","Venda_Mes_Fechado","Itens_Mes_Fechado","Mes_Fechado_Referencia"
+            ]].drop_duplicates("EAN", keep="last").copy()
+            _mes_det_v156["EAN"] = _ean(_mes_det_v156["EAN"])
             produtos_detalhe = produtos_detalhe.merge(
-                menor_preco_loja,
-                on="EAN",
-                how="left"
+                _mes_det_v156, on="EAN", how="left"
             )
 
-    # V1.3.1 - garante que preço/loja/data venham da mesma ocorrência vencedora
-    # do histórico antes de renderizar a tabela de Produtos da recomendação.
-    try:
-        produtos_detalhe = eirox_enriquecer_menor_preco_concorrente(
-            produtos_detalhe, historico
+            produtos_detalhe["Qtd_Vendida_Mes_Anterior"] = pd.to_numeric(
+                produtos_detalhe["Itens_Mes_Fechado"], errors="coerce"
+            )
+            produtos_detalhe["Venda_Preco_Antigo"] = pd.to_numeric(
+                produtos_detalhe["Venda_Mes_Fechado"], errors="coerce"
+            )
+
+        # Se não houver mês fechado para um EAN, mantém o volume do motor,
+        # mas não elimina o produto da recomendação.
+        if "Qtd_Vendida_Mes_Anterior" not in produtos_detalhe.columns:
+            produtos_detalhe["Qtd_Vendida_Mes_Anterior"] = np.nan
+        if "Qtd_Vendida_Motor" in produtos_detalhe.columns:
+            _qdet = pd.to_numeric(produtos_detalhe["Qtd_Vendida_Mes_Anterior"], errors="coerce")
+            _qmot = pd.to_numeric(produtos_detalhe["Qtd_Vendida_Motor"], errors="coerce")
+            produtos_detalhe["Qtd_Vendida_Mes_Anterior"] = _qdet.where(
+                _qdet.notna() & _qdet.gt(0), _qmot
+            )
+
+        # Projeção somente quando preço e volume forem válidos.
+        _pa_det = pd.to_numeric(produtos_detalhe.get("Preco_Atual"), errors="coerce")
+        _ps_det = pd.to_numeric(produtos_detalhe.get("Preco_Sugerido_Mercado"), errors="coerce")
+        _q_det = pd.to_numeric(produtos_detalhe.get("Qtd_Vendida_Mes_Anterior"), errors="coerce")
+
+        produtos_detalhe["Venda_Projetada_Preco_Sugerido"] = np.where(
+            _ps_det.gt(0) & _q_det.gt(0),
+            (_ps_det * _q_det).round(2),
+            np.nan
         )
-    except Exception:
-        pass
 
-    produtos_detalhe = eirox_qd_corrigir_data_exibicao(produtos_detalhe)
+        # Ganho de lucro só existe para aumento de preço.
+        _rec_det = produtos_detalhe["Recomendacao"].fillna("").astype(str).str.upper()
+        _gu_det = (_ps_det - _pa_det).round(2)
+        _gp_det = (_gu_det.clip(lower=0) * _q_det).round(2)
 
-    # V1.4.28 — ENRIQUECIMENTO LOCAL DO DETALHE DE RECOMENDAÇÃO
-    # Corrige somente campos financeiros ausentes/zerados na tabela de detalhe,
-    # sem alterar Recomendacao, filtros, contagens ou classificação do motor.
-    # A fonte prioritária é a própria base já classificada (df_filtrado /
-    # produtos_recomendacao), vinculada por EAN.
-    try:
-        if isinstance(produtos_detalhe, pd.DataFrame) and not produtos_detalhe.empty and "EAN" in produtos_detalhe.columns:
-            _fontes_v1428 = []
-            for _f in [produtos_recomendacao, df_filtrado if "df_filtrado" in globals() else None]:
-                if isinstance(_f, pd.DataFrame) and not _f.empty:
-                    _fontes_v1428.append(_f.copy())
+        produtos_detalhe["Ganho_Unitario"] = np.where(
+            _rec_det.str.contains("SUBIR", na=False) & _gu_det.gt(0),
+            _gu_det,
+            0.0
+        )
+        produtos_detalhe["Ganho_Potencial_Simulador"] = np.where(
+            _rec_det.str.contains("SUBIR", na=False) & _gp_det.gt(0),
+            _gp_det,
+            0.0
+        )
 
-            def _v1428_num_serie(_df, _nomes):
-                _res = pd.Series(np.nan, index=_df.index, dtype="float64")
-                for _n in _nomes:
-                    if _n not in _df.columns:
-                        continue
-                    _s = _eirox_num(_df[_n])
-                    _m = (_res.isna() | (_res <= 0)) & _s.notna() & (_s > 0)
-                    _res.loc[_m] = _s.loc[_m]
-                return _res
+        # Margem e lucro unitário derivados somente de preço/custo reais.
+        if "Margem_%" not in produtos_detalhe.columns:
+            produtos_detalhe["Margem_%"] = np.nan
+        _cu_det = pd.to_numeric(produtos_detalhe.get("Custo"), errors="coerce")
+        _marg_det = np.where(
+            _pa_det.gt(0) & _cu_det.notna(),
+            ((_pa_det - _cu_det) / _pa_det) * 100,
+            np.nan
+        )
+        produtos_detalhe["Margem_%"] = _marg_det
 
-            def _v1428_primeiro_positivo(_s):
-                _x = pd.to_numeric(_s, errors="coerce")
-                _x = _x[_x.notna() & (_x > 0)]
-                return float(_x.iloc[0]) if not _x.empty else np.nan
+        if "Lucro_Unitario" not in produtos_detalhe.columns:
+            produtos_detalhe["Lucro_Unitario"] = np.nan
+        produtos_detalhe["Lucro_Unitario"] = np.where(
+            _pa_det.gt(0) & _cu_det.notna(),
+            _pa_det - _cu_det,
+            np.nan
+        )
 
-            _maps_v1428 = {
-                "Preco_Atual": {},
-                "Qtd_Vendida_Mes_Anterior": {},
-                "Venda_Preco_Antigo": {},
-                "Custo": {},
-            }
+        # Preço médio exibido passa a ser a referência competitiva do motor.
+        if "Preco_Medio" not in produtos_detalhe.columns:
+            produtos_detalhe["Preco_Medio"] = _ps_det
 
-            for _src in _fontes_v1428:
-                _ce = _eirox_first_col(_src, ["EAN", "EAN (GTIN)", "GTIN"])
-                if not _ce:
-                    continue
-                _src["__ean_v1428"] = _src[_ce].apply(_normalizar_ean_eirox)
-                _src["__pa_v1428"] = _v1428_num_serie(_src, [
-                    "Preco_Atual_Venda", "Preço_Atual_Venda", "Preço Atual Venda",
-                    "Preco_Atual", "Preço_Atual", "Preço Atual", "Preco Atual",
-                    "Preço Principal", "Preco Principal", "Preco_Venda", "Preço Venda"
-                ])
-                _src["__qtd_v1428"] = _v1428_num_serie(_src, [
-                    "Qtd_Vendida_Mes_Anterior", "Qtd Vendida Mês Anterior",
-                    "Qtd Vendida Mes Anterior", "Qtd_Vendida", "Qtd Vendida",
-                    "Quantidade Vendida", "Quantidade_Vendida"
-                ])
-                _src["__va_v1428"] = _v1428_num_serie(_src, [
-                    "Venda_Preco_Antigo", "Venda Preço Antigo", "Venda Preco Antigo",
-                    "Faturamento Atual", "Faturamento_Atual", "Venda Atual", "Venda_Atual"
-                ])
-                _src["__cu_v1428"] = _v1428_num_serie(_src, [
-                    "Custo", "Custo_Unitario", "Custo Unitário", "Custo Unitario",
-                    "Custo_Unitario_Eirox", "Custo Atual"
-                ])
+        # Ordenação: ações de subida por ganho; demais preservam produto/EAN.
+        if str(recomendacao_selecionada).upper().startswith("SUBIR"):
+            produtos_detalhe = produtos_detalhe.sort_values(
+                "Ganho_Potencial_Simulador", ascending=False, kind="stable"
+            )
+        elif "Produto" in produtos_detalhe.columns:
+            produtos_detalhe = produtos_detalhe.sort_values(
+                "Produto", ascending=True, kind="stable"
+            )
 
-                _lk = _src.groupby("__ean_v1428", as_index=True).agg(
-                    Preco_Atual=("__pa_v1428", _v1428_primeiro_positivo),
-                    Qtd_Vendida_Mes_Anterior=("__qtd_v1428", _v1428_primeiro_positivo),
-                    Venda_Preco_Antigo=("__va_v1428", _v1428_primeiro_positivo),
-                    Custo=("__cu_v1428", _v1428_primeiro_positivo),
-                )
-                for _campo in _maps_v1428:
-                    for _ean, _valor in _lk[_campo].dropna().items():
-                        if _valor > 0 and _ean not in _maps_v1428[_campo]:
-                            _maps_v1428[_campo][_ean] = float(_valor)
+except Exception:
+    # Mesmo se algum enriquecimento falhar, nunca apaga a população contada.
+    produtos_detalhe = produtos_recomendacao.drop_duplicates(subset=["EAN"], keep="first").copy()
 
-            _eans_det = produtos_detalhe["EAN"].apply(_normalizar_ean_eirox)
-            for _campo in ["Preco_Atual", "Qtd_Vendida_Mes_Anterior", "Venda_Preco_Antigo", "Custo"]:
-                if _campo not in produtos_detalhe.columns:
-                    produtos_detalhe[_campo] = np.nan
-                _atual = _eirox_num(produtos_detalhe[_campo])
-                _rec = _eans_det.map(_maps_v1428[_campo])
-                _mask = (_atual.isna() | (_atual <= 0)) & _rec.notna() & (_rec > 0)
-                produtos_detalhe.loc[_mask, _campo] = _rec.loc[_mask]
-
-            # Se a quantidade veio apenas da projeção, recupera sem inventar dado:
-            # quantidade = venda projetada / preço sugerido.
-            if "Qtd_Vendida_Mes_Anterior" in produtos_detalhe.columns:
-                _q = _eirox_num(produtos_detalhe["Qtd_Vendida_Mes_Anterior"])
-                _vp = _eirox_num(produtos_detalhe.get("Venda_Projetada_Preco_Sugerido", pd.Series(np.nan, index=produtos_detalhe.index)))
-                _ps = _eirox_num(produtos_detalhe.get("Preco_Sugerido_Mercado", pd.Series(np.nan, index=produtos_detalhe.index)))
-                _qcalc = _vp / _ps.replace(0, np.nan)
-                _maskq = (_q.isna() | (_q <= 0)) & _qcalc.notna() & (_qcalc > 0)
-                produtos_detalhe.loc[_maskq, "Qtd_Vendida_Mes_Anterior"] = _qcalc.loc[_maskq].round(0)
-
-            # Com preço atual + quantidade válidos, venda antiga passa a ser
-            # calculável; a função financeira abaixo recalculará ganhos.
-            _pa = _eirox_num(produtos_detalhe["Preco_Atual"])
-            _q = _eirox_num(produtos_detalhe["Qtd_Vendida_Mes_Anterior"])
-            _va = _eirox_num(produtos_detalhe["Venda_Preco_Antigo"])
-            _vacalc = _pa * _q
-            _maskva = (_va.isna() | (_va <= 0)) & _vacalc.notna() & (_vacalc > 0)
-            produtos_detalhe.loc[_maskva, "Venda_Preco_Antigo"] = _vacalc.loc[_maskva]
-    except Exception:
-        pass
-
-    produtos_detalhe = produtos_detalhe.sort_values(
-        "Ganho_Potencial_Simulador",
-        ascending=False
-    )
-
-else:
-
-    produtos_detalhe = pd.DataFrame()
 
 if not produtos_detalhe.empty:
 
@@ -28544,8 +33985,7 @@ if not produtos_detalhe.empty:
 else:
 
     st.warning(
-        "Não há produtos dessa recomendação com dados completos no Simulador. "
-        "Isso ocorre quando o EAN não existe na venda da rede ou não teve venda no período."
+        "Não há produtos na recomendação selecionada para os filtros atuais."
     )
 
 
@@ -30082,116 +35522,10 @@ if not compra.empty:
     )
 
 # --------------------------------------------------
-
-# SCORE EIROX
-
+# ÍNDICE EIROX
 # --------------------------------------------------
-
-st.subheader(
-    "🤖 Índice de Oportunidade Eirox"
-)
-
-# Cálculo do índice com tratamento seguro para evitar erro caso alguma coluna não exista.
-margem_media_score = 0
-if "Margem_%" in df_filtrado.columns:
-    margem_media_score = pd.to_numeric(
-        df_filtrado["Margem_%"],
-        errors="coerce"
-    ).dropna().mean()
-
-ganho_potencial_score = 0
-if "Ganho_Potencial" in df_filtrado.columns:
-    ganho_potencial_score = pd.to_numeric(
-        df_filtrado["Ganho_Potencial"],
-        errors="coerce"
-    ).fillna(0).sum()
-
-score = round(
-    (margem_media_score * 0.6)
-    +
-    ((ganho_potencial_score / 1000) * 0.4)
-)
-
-st.metric(
-    "Índice Eirox",
-    score
-)
-
-with st.expander("🎯 Entenda o Índice de Oportunidade Eirox", expanded=False):
-
-    st.markdown("""
-### Como funciona o Índice de Oportunidade Eirox?
-
-O Índice Eirox identifica os produtos com maior potencial de geração de resultado através de ações de Pricing.
-
----
-
-### 💰 Potencial de Captura
-
-Representa o valor adicional que a empresa poderia faturar ao ajustar o preço do produto até o limite competitivo do mercado, sem ficar mais cara que a concorrência.
-
-#### Como calculamos?
-
-**Espaço para aumento = Preço Máximo Competitivo - Preço Atual**
-
-**Potencial de Captura = Espaço para aumento × Quantidade vendida no mês anterior**
-
-#### Exemplo
-
-- Preço Atual: R$ 10,00
-- Concorrência: R$ 12,00
-- Espaço para aumento: R$ 2,00
-- Quantidade vendida no mês anterior: 1.000 unidades
-
-**Potencial de Captura = R$ 2,00 × 1.000 = R$ 2.000**
-
-Ou seja, existe uma oportunidade de gerar aproximadamente **R$ 2.000 adicionais** sem ultrapassar o preço da concorrência.
-
----
-
-### 📈 Composição do Índice Eirox
-
-**60% → Rentabilidade Atual**
-
-Representa a qualidade da margem do produto.
-
-**40% → Potencial de Captura**
-
-Representa o tamanho financeiro da oportunidade.
-
-#### Fórmula
-
-**Índice Eirox = (Rentabilidade Atual × 60%) + ((Potencial de Captura ÷ 1.000) × 40%)**
-
----
-
-### Como interpretar?
-
-🟢 **Acima de 70 pontos**
-
-- Produto altamente rentável.
-- Grande oportunidade de captura de resultado.
-
-🟡 **Entre 40 e 70 pontos**
-
-- Produto com potencial relevante de otimização.
-
-🔴 **Abaixo de 40 pontos**
-
-- Baixo impacto financeiro para ações de Pricing.
-
----
-
-### Resumo
-
-Quanto maior o Índice Eirox, maior a combinação entre:
-
-✔ Rentabilidade atual
-
-✔ Espaço para aumento de preço
-
-✔ Potencial financeiro de captura de resultado
-""")
+# V1.4.61: exibido no topo do Dashboard Geral para permanecer visível
+# também quando o usuário alterna para o Motor de Rentabilidade.
 
 
 # --------------------------------------------------
@@ -30498,7 +35832,7 @@ if (
 # --------------------------------------------------
 
 st.subheader(
-    "💵 Simulador de Ganho com Ajuste de Preço"
+    "💵 Simulador de Ganho — Mesma Base do Subir Preço"
 )
 
 if not simulacao_global.empty:
@@ -30517,27 +35851,44 @@ if not simulacao_global.empty:
         ascending=False
     )
 
-    k1, k2, k3, k4 = st.columns(4)
+    # V1.4.53 — cards reconciliados e auditáveis.
+    k1, k2, k3, k4, k5 = st.columns(5)
 
     k1.metric(
         "Produtos com Oportunidade",
-        len(simulacao)
+        f"{len(simulacao):,}".replace(",", ".")
     )
 
     k2.metric(
-        "Venda Preço Antigo",
-        moeda_br(simulacao["Venda_Preco_Antigo"].sum())
+        "Venda Real Último Mês",
+        moeda_br(simulacao["Venda_Real_Mes_Fechado"].sum())
+        if "Venda_Real_Mes_Fechado" in simulacao.columns else "—"
     )
 
     k3.metric(
+        "Venda ao Preço Atual",
+        moeda_br(simulacao["Venda_Preco_Antigo"].sum())
+    )
+
+    k4.metric(
         "Venda com Preço Sugerido",
         moeda_br(simulacao["Venda_Projetada_Preco_Sugerido"].sum())
     )
 
-    k4.metric(
-        "Ganho Total",
+    k5.metric(
+        "Ganho Potencial",
         moeda_br(simulacao["Ganho_Potencial_Simulador"].sum())
     )
+
+    if "Mes_Fechado_Referencia" in simulacao.columns:
+        _meses_sim_v153 = sorted(
+            simulacao["Mes_Fechado_Referencia"].dropna().astype(str).unique().tolist()
+        )
+        if _meses_sim_v153:
+            st.caption(
+                "Mesma população do Subir Preço. Volume: último mês fechado com venda de cada EAN. "
+                "Competências utilizadas: " + ", ".join(_meses_sim_v153)
+            )
 
     # Garante que a tela mostre somente o nome comercial da rede.
     # Se a coluna Rede vier vazia, identifica a rede pela razão social/loja,
@@ -30566,7 +35917,9 @@ if not simulacao_global.empty:
         colunas_exibir.append("Produto")
 
     colunas_exibir += [
+        "Mes_Fechado_Referencia",
         "Qtd_Vendida_Mes_Anterior",
+        "Venda_Real_Mes_Fechado",
         "Venda_Preco_Antigo",
         "Preco_Atual",
         "Preco_Sugerido_Mercado",
@@ -30610,6 +35963,7 @@ if not simulacao_global.empty:
         pass
 
     for coluna in [
+        "Venda_Real_Mes_Fechado",
         "Venda_Preco_Antigo",
         "Preco_Atual",
         "Preco_Sugerido_Mercado",
@@ -30633,8 +35987,10 @@ if not simulacao_global.empty:
             simulacao_exibir[coluna_data] = simulacao_exibir[coluna_data].apply(data_br)
 
     simulacao_exibir = simulacao_exibir.rename(columns={
-        "Qtd_Vendida_Mes_Anterior": "Qtd Vendida Mês Anterior",
-        "Venda_Preco_Antigo": "Venda Preço Antigo",
+        "Mes_Fechado_Referencia": "Mês Ref. Venda",
+        "Qtd_Vendida_Mes_Anterior": "Qtd Último Mês Fechado",
+        "Venda_Real_Mes_Fechado": "Venda Real Último Mês",
+        "Venda_Preco_Antigo": "Venda ao Preço Atual",
         "Preco_Atual": "Preço Atual",
         "Preco_Sugerido_Mercado": "Preço Máximo Competitivo",
         "Rede_Preco_Maximo_Competitivo": "Rede Preço Máximo Competitivo",
@@ -30651,77 +36007,49 @@ if not simulacao_global.empty:
         simulacao_exibir,
     )
 
-    # Gráfico oficial do Dashboard: usa apenas Analise_Pricing.xlsx
-    base_ganho_oficial = preparar_ganho_oficial_dashboard(
-        df_filtrado
-    )
-
-    eixo_produto_grafico = (
-        "Produto"
-        if "Produto" in base_ganho_oficial.columns
-        else "EAN"
-    )
-
-    top_ganho_grafico = (
-        base_ganho_oficial
-        .sort_values(
-            "Ganho_Potencial",
-            ascending=True
-        )
+    # V1.4.53 — gráfico usa exatamente o mesmo ganho reconciliado dos cards/tabela.
+    _top_sim_v153 = (
+        simulacao.sort_values("Ganho_Potencial_Simulador", ascending=True)
         .tail(20)
         .copy()
     )
-
-    top_ganho_grafico["Ganho_Label"] = (
-        top_ganho_grafico["Ganho_Potencial"]
-        .apply(moeda_br)
-    )
+    _eixo_prod_v153 = "Produto" if "Produto" in _top_sim_v153.columns else "EAN"
+    _top_sim_v153["Ganho_Label"] = _top_sim_v153["Ganho_Potencial_Simulador"].apply(moeda_br)
 
     fig = px.bar(
-        top_ganho_grafico,
-        x="Ganho_Potencial",
-        y=eixo_produto_grafico,
+        _top_sim_v153,
+        x="Ganho_Potencial_Simulador",
+        y=_eixo_prod_v153,
         orientation="h",
         text="Ganho_Label",
-        title="Top 20 Produtos com Maior Ganho Projetado",
+        title="Top 20 Produtos com Maior Ganho Potencial Reconciliado",
         labels={
-            "Ganho_Potencial": "Ganho Projetado",
-            eixo_produto_grafico: "Produto"
+            "Ganho_Potencial_Simulador": "Ganho Potencial",
+            _eixo_prod_v153: "Produto"
         }
     )
-
     fig.update_traces(
         textposition="outside",
-        cliponaxis=False
+        cliponaxis=False,
+        customdata=_top_sim_v153[["Ganho_Label"]].to_numpy(),
+        hovertemplate="%{y}<br>Ganho: %{customdata[0]}<extra></extra>"
     )
-
     fig.update_layout(
         height=650,
-        margin=dict(
-            l=20,
-            r=180,
-            t=60,
-            b=40
-        ),
+        margin=dict(l=20,r=180,t=60,b=40),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(
-            tickformat=",",
-            showgrid=True
-        ),
-        yaxis=dict(
-            automargin=True
-        )
+        yaxis=dict(automargin=True)
     )
-
-    st.plotly_chart(
-        fig,
-        key="dashboard_ganho_oficial"
-    )
+    st.plotly_chart(fig, key="dashboard_ganho_reconciliado")
 
 else:
-
-    pass
+    _motivo_sim_v157 = str(globals().get("origem_simulacao_global", "sem_calculo"))
+    st.info(
+        "O simulador não encontrou oportunidades válidas para os filtros atuais. "
+        f"Diagnóstico: {_motivo_sim_v157}. "
+        "A base geral e as recomendações continuam disponíveis."
+    )
 
 
 # --------------------------------------------------
