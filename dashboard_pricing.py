@@ -452,7 +452,7 @@ EIROX_CLIENT_PROFILES = {
         "page_title": "Eirox Pricing Enterprise",
         "logo": "logo eirox.png",
         "admin_title": "Gestão Eirox",
-        "about_page": "📌 Sobre o Eirox",
+        "about_page": "📌 Sobre a Intedados",
         "excel_brand": "EIROX PRICING ENTERPRISE",
         "data_dirs": {
             "historico": "VENDA_TESTE",
@@ -462,7 +462,9 @@ EIROX_CLIENT_PROFILES = {
         },
     },
     "intedados": {
-        "key": "intedados",
+        # A chave analítica permanece "carceres" de propósito:
+        # os dois deploys usam a MESMA assinatura, snapshot e regras de dados.
+        "key": "carceres",
         "brand": "Intedados",
         "product": "Intedados Pricing Enterprise",
         "page_title": "Intedados Pricing Enterprise",
@@ -1429,6 +1431,7 @@ def garantir_colunas_padrao_dashboard(df_base):
 
 
 
+
 def eirox_ultima_venda_por_ean(venda, ean_col, qtd_col=None, preco_col=None, valor_total_col=None):
     """Última venda transacional válida; nunca usa média ou fechamento mensal."""
     cols = ["EAN", "Preco_Ultima_Venda", "Data_Ultima_Venda"]
@@ -1479,6 +1482,7 @@ def eirox_ultima_venda_por_ean(venda, ean_col, qtd_col=None, preco_col=None, val
         "_PRECO_UNIT_ULT_VENDA": "Preco_Ultima_Venda",
         "_DATA_ULT_VENDA": "Data_Ultima_Venda"
     }).reset_index(drop=True)
+
 
 def _v143_original_construir_base_pricing_somente_pastas(historico, compra, venda_rede, estoque):
     try:
@@ -1700,6 +1704,7 @@ pio.templates.default = "plotly_dark"
 # --------------------------------------------------
 
 ARQUIVO_CADASTRO_CNPJ_CLIENTE = Path("CADASTRO_CLIENTE_CNPJ.csv")
+
 
 def normalizar_cnpj_eirox(valor):
     try:
@@ -6214,7 +6219,7 @@ def eirox_base_cliente_produtos_para_comparacao(df_produtos, cliente_nome="Clien
 
         # Preço principal vem da base interna / simulador / preço atual.
         preco_col = None
-        for c in ["Preco_Atual", "Preço Atual", "Preco Atual", "Preço_Atual", "Preco_Medio", "Preço Médio"]:
+        for c in ["Preco_Atual", "Preço Atual", "Preco Atual", "Preço_Atual"]:
             if c in base.columns:
                 preco_col = c
                 break
@@ -6235,7 +6240,7 @@ def eirox_base_cliente_produtos_para_comparacao(df_produtos, cliente_nome="Clien
             .groupby("EAN", as_index=False)
             .agg(
                 Produto_Pesquisa=(produto_col, "first") if produto_col else ("EAN", "first"),
-                Preco_Selecionado=("_PRECO_PRINCIPAL_COMP", "mean"),
+                Preco_Selecionado=("_PRECO_PRINCIPAL_COMP", "first"),
                 Qtd_Pesquisas_Selecionado=("_PRECO_PRINCIPAL_COMP", "count")
             )
         )
@@ -6332,9 +6337,7 @@ def aplicar_engine_recomendacoes_restaurada(df_base):
                 "Preco Atual",
                 "Preço_Atual",
                 "Preco_Selecionado",
-                "Preço Principal",
-                "Preco_Medio",
-                "Preço Médio"
+                "Preço Principal"
             ],
             0
         )
@@ -8042,7 +8045,7 @@ def eirox_enriquecer_pipeline_municipio(df_pesquisa, compra_base, estoque_base, 
 
 
 # EIROX PRICING 2.0 — FASE 7: NAVEGAÇÃO, FILTROS E EXPORTAÇÃO GLOBAL.
-VERSAO_APP = "Enterprise 2.0 — Fase 8.20 — Rebranding Intedados"
+VERSAO_APP = "Enterprise 2.0 — Fase 8.21 — Referência Única de Dados"
 
 # --------------------------------------------------
 # FORMATACAO BRASIL
@@ -13994,7 +13997,7 @@ def adicionar_recomendacoes_ao_workflow(recomendacoes_df, origem="IA Pricing"):
             ean = str(row.get("EAN", ""))
             produto = str(row.get("Produto", ""))
             acao = str(row.get("Ação", row.get("Tipo_Oportunidade", "")))
-            preco_atual = str(row.get("Preço_Atual", row.get("Preco_Medio", "")))
+            preco_atual = str(row.get("Preço_Atual", row.get("Preco_Atual", "")))
             preco_rec = str(row.get("Preço_Recomendado", row.get("Preco_Recomendado", "")))
             ganho = str(row.get("Ganho_Estimado", row.get("Ganho_Potencial", "")))
 
@@ -14491,7 +14494,7 @@ def filtrar_paginas_por_plano(paginas):
 
         plano = plano_empresa_contexto()
 
-        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a Intedados', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Central de Qualidade', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
+        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre o Eirox', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Central de Qualidade', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
 
         # Garante que todas as páginas de cliente existentes entrem no menu conforme o plano.
         todas_paginas_cliente = ["⚖️ Cliente x Principal Concorrente", '🏢 Portal do Cliente', '📋 Workflow Comercial', '🤖 IA Pricing Enterprise', '🏢 Dashboard Executivo', '🌎 Mapa Geográfico de Concorrência', '🔎 Rede/Loja vs Concorrentes']
@@ -14525,7 +14528,7 @@ def dividir_menu_cliente_admin(paginas):
     try:
         paginas = list(paginas)
 
-        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a Intedados', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
+        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre o Eirox', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
 
         cliente = [p for p in paginas if p not in admin_pages]
         admin = [p for p in paginas if p in admin_pages]
@@ -21327,11 +21330,11 @@ def eirox_v135_corrigir_financeiro_subir_preco(df):
     qtd_por_proj = venda_projetada / preco_sugerido.replace(0, np.nan)
     qtd = qtd.where(qtd.notna() & (qtd > 0), qtd_por_proj)
 
-    # 3) Com a quantidade recuperada, Venda Preço Antigo / Qtd recupera Preço Atual.
-    calc_preco_por_venda = venda_antiga / qtd.replace(0, np.nan)
-    preco_atual = preco_atual.where(preco_atual.notna() & (preco_atual > 0), calc_preco_por_venda)
+    # 3) REGRA V1.4.39: NÃO recuperar Preço Atual por Venda/Quantidade.
+    # Essa divisão produz preço médio ponderado e pode criar valores que nunca foram praticados.
 
-    # 4) Se ainda faltar quantidade, tenta Venda Antiga / Preço Atual.
+    # 4) Se ainda faltar quantidade, tenta Venda Antiga / Preço Atual somente quando
+    # o Preço Atual já veio de uma fonte unitária real.
     qtd_por_antiga = venda_antiga / preco_atual.replace(0, np.nan)
     qtd = qtd.where(qtd.notna() & (qtd > 0), qtd_por_antiga)
 
@@ -23382,7 +23385,6 @@ def eirox_v159_simulacao_unificada(base):
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-
 def eirox_v147_mapa_menor_preco_bruto(_assinatura_venda=""):
     """Mapa atômico EAN -> menor preço/loja/data direto da VENDA_TESTE.
 
@@ -25273,6 +25275,7 @@ if pagina == "📋 Workflow Comercial":
 
 
 # --------------------------------------------------
+
 
 def eirox_formatar_view_ia(df_view):
     if not isinstance(df_view, pd.DataFrame) or df_view.empty:
@@ -28595,19 +28598,9 @@ if pagina == "📈 Simulador Inteligente":
                     f"{linha.get('Farmácia', '')} | {linha.get('Rede', '')}"
                 )
 
-        if isinstance(venda_final_preparada, pd.DataFrame) and not venda_final_preparada.empty:
-            vf = venda_final_preparada[
-                venda_final_preparada["EAN_SIM"] == ean
-            ].copy()
-
-            if not vf.empty and vf["Itens_SIM"].sum() > 0 and vf["Venda_SIM"].sum() > 0:
-                return (
-                    float(vf["Venda_SIM"].sum() / vf["Itens_SIM"].sum()),
-                    "VENDA_FINAL_TESTE - preço médio Venda / Itens",
-                    ""
-                )
-
-        return 0.0, "Preço atual não localizado", ""
+        # VENDA_FINAL_TESTE contém faturamento e quantidade agregados.
+        # Não usar Venda/Itens como preço atual: isso é média, não última venda real.
+        return 0.0, "Preço atual real não localizado (sem venda unitária datada)", ""
 
     def _dados_custo_sim(ean, estoque_preparado, venda_final_preparada):
         ean = _normalizar_ean_sim(ean)
@@ -37260,7 +37253,6 @@ div[data-testid="element-container"]:has(div[data-testid="stImage"]) {
 }
 </style>
 """, unsafe_allow_html=True)
-
 
 # ============================================================
 # INTEDADOS — IDENTIDADE VISUAL GLOBAL
