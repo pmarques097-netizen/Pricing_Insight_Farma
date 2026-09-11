@@ -461,15 +461,15 @@ EIROX_CLIENT_PROFILES = {
             "compra": "COMPRA_TESTE",
         },
     },
-    "insightfarma": {
-        "key": "insightfarma",
-        "brand": "InsightFarma",
-        "product": "InsightFarma Pricing Enterprise",
-        "page_title": "InsightFarma Pricing Enterprise",
-        "logo": "logo insightfarma.png",
-        "admin_title": "Gestão InsightFarma",
-        "about_page": "📌 Sobre a InsightFarma",
-        "excel_brand": "INSIGHTFARMA PRICING ENTERPRISE",
+    "intedados": {
+        "key": "intedados",
+        "brand": "Intedados",
+        "product": "Intedados Pricing Enterprise",
+        "page_title": "Intedados Pricing Enterprise",
+        "logo": "logo intedados.png",
+        "admin_title": "Gestão Intedados",
+        "about_page": "📌 Sobre a Intedados",
+        "excel_brand": "INTEDADOS PRICING ENTERPRISE",
         "data_dirs": {
             "historico": "VENDA_TESTE",
             "venda": "VENDA_FINAL_TESTE",
@@ -479,7 +479,7 @@ EIROX_CLIENT_PROFILES = {
     },
 }
 
-EIROX_CLIENT_KEY = "insightfarma"
+EIROX_CLIENT_KEY = "intedados"
 EIROX_CLIENT_PROFILE = EIROX_CLIENT_PROFILES[EIROX_CLIENT_KEY]
 
 
@@ -3712,7 +3712,7 @@ def eirox_render_header_premium():
     st.markdown(
         f"""
         <div class="eirox-hero-premium">
-            <div class="eirox-hero-kicker">InsightFarma Pricing Enterprise</div>
+            <div class="eirox-hero-kicker">Intedados Pricing Enterprise</div>
             <h1 class="eirox-hero-title">Cockpit Executivo de Pricing</h1>
             <div class="eirox-hero-subtitle">
                 Cliente: <b>{cliente}</b> · Última atualização: <b>{agora}</b>
@@ -7824,7 +7824,7 @@ def eirox_menu_unico_sidebar(paginas_cliente, paginas_admin, plano_atual):
             st.markdown(
                 """
                 <div class="eirox-menu-kicker-v1422 eirox-admin-kicker-v1422">Área Administrativa</div>
-                <div class="eirox-menu-title-v1422">Gestão InsightFarma</div>
+                <div class="eirox-menu-title-v1422">Gestão Intedados</div>
                 <div class="eirox-menu-sub-v1422">Administração, segurança e operação</div>
                 """,
                 unsafe_allow_html=True,
@@ -8042,7 +8042,7 @@ def eirox_enriquecer_pipeline_municipio(df_pesquisa, compra_base, estoque_base, 
 
 
 # EIROX PRICING 2.0 — FASE 7: NAVEGAÇÃO, FILTROS E EXPORTAÇÃO GLOBAL.
-VERSAO_APP = "Enterprise 2.0 — Fase 8.19 — Unidade Numeral Forçada"
+VERSAO_APP = "Enterprise 2.0 — Fase 8.20 — Rebranding Intedados"
 
 # --------------------------------------------------
 # FORMATACAO BRASIL
@@ -11266,7 +11266,7 @@ def enviar_alerta_localizacao_capturada():
         ambiente = "Streamlit Cloud" if "/mount/src" in str(Path.cwd()) else "Localhost"
 
         mensagem = (
-            "📍 <b>Localização capturada no InsightFarma Pricing</b>\n\n"
+            "📍 <b>Localização capturada no Intedados Pricing</b>\n\n"
             f"👤 <b>Usuário:</b> {usuario}\n"
             f"🙋 <b>Nome:</b> {nome}\n"
             f"🔐 <b>Perfil:</b> {perfil}\n"
@@ -11300,7 +11300,7 @@ def registrar_alerta_login(usuario, nome, perfil):
         ambiente = "Streamlit Cloud" if "/mount/src" in str(Path.cwd()) else "Localhost"
 
         mensagem = (
-            "🚀 <b>Novo acesso no InsightFarma Pricing</b>\n\n"
+            "🚀 <b>Novo acesso no Intedados Pricing</b>\n\n"
             f"👤 <b>Usuário:</b> {usuario}\n"
             f"🙋 <b>Nome:</b> {nome}\n"
             f"🔐 <b>Perfil:</b> {perfil}\n"
@@ -11337,7 +11337,7 @@ def registrar_alerta_navegacao_async(pagina):
         ambiente = "Streamlit Cloud" if "/mount/src" in str(Path.cwd()) else "Localhost"
 
         mensagem = (
-            "🧭 <b>Navegação no InsightFarma Pricing</b>\n\n"
+            "🧭 <b>Navegação no Intedados Pricing</b>\n\n"
             f"👤 <b>Usuário:</b> {usuario}\n"
             f"🙋 <b>Nome:</b> {nome}\n"
             f"🔐 <b>Perfil:</b> {perfil}\n"
@@ -11643,7 +11643,7 @@ def gerar_backup_eirox(nome_manual=""):
 
         try:
             enviar_alerta_telegram(
-                "📦 <b>Backup gerado no InsightFarma Pricing</b>\\n\\n"
+                "📦 <b>Backup gerado no Intedados Pricing</b>\\n\\n"
                 f"📄 <b>Arquivo:</b> {zip_path.name}\\n"
                 f"📦 <b>Tamanho:</b> {_backup_tamanho_formatado(tamanho)}\\n"
                 f"✅ <b>Itens incluídos:</b> {len(itens_incluidos)}\\n"
@@ -12171,7 +12171,7 @@ DESCRICOES_TELAS_ENTERPRISE = {
     "🟢 Saúde do Sistema": "Monitoramento operacional do ambiente, performance, integridade das bases e integrações.",
     "📦 Backup Center": "Gerenciamento de backups, restauração e proteção das informações críticas do sistema.",
     "🏢 Multiempresa": "Administração de empresas, segregação de dados e preparação do ambiente SaaS.",
-    "📌 Sobre a InsightFarma": "Informações institucionais, propósito da plataforma e visão geral do produto.",
+    "📌 Sobre a Intedados": "Informações institucionais, propósito da plataforma e visão geral do produto.",
     "🧭 Roadmap do Produto": "Plano evolutivo da plataforma, módulos concluídos, próximos ciclos e prioridades.",
     "💼 Licenciamento Multiempresa": "Modelo comercial, planos de uso, governança de clientes e expansão SaaS.",
     "💼 Licenciamento Real": "Controle real de planos, expiração, limites de usuários, lojas e bloqueio de licença.",
@@ -14411,7 +14411,7 @@ TELAS_ADMIN_EIROX = [
     "💼 Licenciamento Real",
     "🏢 CRM Enterprise",
     "🏁 Release Candidate",
-    "📌 Sobre a InsightFarma",
+    "📌 Sobre a Intedados",
     "🧭 Roadmap do Produto",
     "🧪 Diagnóstico",
     "💳 Billing Enterprise"]
@@ -14491,7 +14491,7 @@ def filtrar_paginas_por_plano(paginas):
 
         plano = plano_empresa_contexto()
 
-        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a InsightFarma', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Central de Qualidade', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
+        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a Intedados', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Central de Qualidade', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
 
         # Garante que todas as páginas de cliente existentes entrem no menu conforme o plano.
         todas_paginas_cliente = ["⚖️ Cliente x Principal Concorrente", '🏢 Portal do Cliente', '📋 Workflow Comercial', '🤖 IA Pricing Enterprise', '🏢 Dashboard Executivo', '🌎 Mapa Geográfico de Concorrência', '🔎 Rede/Loja vs Concorrentes']
@@ -14519,13 +14519,13 @@ def filtrar_paginas_por_plano(paginas):
 
 def dividir_menu_cliente_admin(paginas):
     """
-    Separa menu em Área do Cliente e Administração InsightFarma.
+    Separa menu em Área do Cliente e Administração Intedados.
     """
 
     try:
         paginas = list(paginas)
 
-        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a InsightFarma', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
+        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a Intedados', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
 
         cliente = [p for p in paginas if p not in admin_pages]
         admin = [p for p in paginas if p in admin_pages]
@@ -14804,7 +14804,7 @@ def portal_novidades():
     return pd.DataFrame(
         [
             {"Versão": "v1.39.1", "Novidade": "Portal do Cliente Enterprise", "Descrição": "Minha empresa, licença, uso, suporte e central de conhecimento."},
-            {"Versão": "v1.38.1", "Novidade": "Menu por plano", "Descrição": "Área do Cliente separada da Administração InsightFarma."},
+            {"Versão": "v1.38.1", "Novidade": "Menu por plano", "Descrição": "Área do Cliente separada da Administração Intedados."},
             {"Versão": "v1.38.0", "Novidade": "CRM Enterprise", "Descrição": "Gestão comercial de clientes, planos, MRR e implantação."},
             {"Versão": "v1.37.1", "Novidade": "Workflow Comercial", "Descrição": "Aprovação e rejeição de recomendações da IA."},
             {"Versão": "v1.37.0", "Novidade": "IA Pricing Enterprise", "Descrição": "Recomendações automáticas de preço."},
@@ -16176,7 +16176,7 @@ def tela_login():
         st.markdown(
             """
             <div style="text-align:center; margin-top:2px; margin-bottom:12px;">
-                <h1 style="font-size:1.70rem;line-height:1.08;margin:0 0 7px 0;">InsightFarma Pricing</h1>
+                <h1 style="font-size:1.70rem;line-height:1.08;margin:0 0 7px 0;">Intedados Pricing</h1>
                 <div style="font-size:1.03rem;font-weight:400;color:#B7C7D8;line-height:1.2;">
                     Inteligência de Pricing para Drogarias
                 </div>
@@ -16359,7 +16359,7 @@ except:
 st.markdown(
     """
     <div class="eirox-hero" style="max-height:none !important;height:auto !important;overflow:visible !important;padding:10px 18px 11px 20px !important;margin-bottom:12px !important;">
-        <div class="eirox-section-title" style="font-size:0.68rem !important;line-height:1.05 !important;margin-bottom:5px !important;">InsightFarma Pricing Enterprise</div>
+        <div class="eirox-section-title" style="font-size:0.68rem !important;line-height:1.05 !important;margin-bottom:5px !important;">Intedados Pricing Enterprise</div>
         <h1 style="font-size:1.38rem !important;line-height:1.12 !important;margin:0 !important;padding:0 !important;">📊 Inteligência de Pricing & Competitividade</h1>
         <p style="font-size:0.80rem !important;line-height:1.2 !important;margin:5px 0 0 0 !important;">Monitoramento executivo de preços, concorrência, margem, alertas e oportunidades comerciais.</p>
     </div>
@@ -20273,7 +20273,7 @@ if usuario_pode_ver_multiempresa() and "🏢 Multiempresa" not in paginas_libera
 
 if usuario_pode_ver_multiempresa():
     for pagina_enterprise in [
-        "📌 Sobre a InsightFarma",
+        "📌 Sobre a Intedados",
         "🧭 Roadmap do Produto",
         "💼 Licenciamento Multiempresa",
         "💼 Licenciamento Real",
@@ -25840,9 +25840,9 @@ if pagina == "👥 Controle de Usuários":
 # SOBRE O EIROX ENTERPRISE
 # --------------------------------------------------
 
-if pagina == "📌 Sobre a InsightFarma":
+if pagina == "📌 Sobre a Intedados":
 
-    mostrar_explicacao_visao_eirox("📌 Sobre a InsightFarma")
+    mostrar_explicacao_visao_eirox("📌 Sobre a Intedados")
 
     if not usuario_pode_ver_multiempresa():
         st.error("Acesso não autorizado.")
@@ -25851,14 +25851,14 @@ if pagina == "📌 Sobre a InsightFarma":
     st.markdown(
         """
         <div class="eirox-hero">
-            <div class="eirox-section-title">InsightFarma Pricing Enterprise</div>
-            <h1>📌 Sobre a InsightFarma Enterprise</h1>
+            <div class="eirox-section-title">Intedados Pricing Enterprise</div>
+            <h1>📌 Sobre a Intedados Enterprise</h1>
             <p>Plataforma de inteligência de pricing, competitividade e governança para redes de farmácia.</p>
         """,
         unsafe_allow_html=True
     )
 
-    legenda_tela("📌 Sobre a InsightFarma")
+    legenda_tela("📌 Sobre a Intedados")
 
     c1, c2, c3 = st.columns(3)
 
@@ -33014,7 +33014,7 @@ st.markdown(
 st.markdown(
     f"""
     <section class="eirox-dash-hero-v1420">
-      <div class="eirox-dash-eyebrow-v1420">InsightFarma Pricing Enterprise · Visão Executiva</div>
+      <div class="eirox-dash-eyebrow-v1420">Intedados Pricing Enterprise · Visão Executiva</div>
       <h1 class="eirox-dash-title-v1420">Dashboard Geral</h1>
       <div class="eirox-dash-sub-v1420">
         Inteligência de pricing, competitividade e rentabilidade em uma visão única para apresentação e decisão executiva.
@@ -37263,12 +37263,12 @@ div[data-testid="element-container"]:has(div[data-testid="stImage"]) {
 
 
 # ============================================================
-# INSIGHTFARMA — IDENTIDADE VISUAL GLOBAL
+# INTEDADOS — IDENTIDADE VISUAL GLOBAL
 # Camada final de marca. Não altera regras de negócio.
-# Paleta derivada da logo oficial InsightFarma.
+# Paleta derivada da logo oficial Intedados.
 # ============================================================
 st.markdown("""
-<style id="insightfarma-brand-global">
+<style id="intedados-brand-global">
 :root {
   --if-cyan:#00C6FF;
   --if-blue:#0066FF;
