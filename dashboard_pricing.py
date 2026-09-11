@@ -448,10 +448,10 @@ EIROX_CLIENT_PROFILES = {
     "carceres": {
         "key": "carceres",
         "brand": "Eirox",
-        "product": "Eirox Pricing Enterprise",
-        "page_title": "Eirox Pricing Enterprise",
+        "product": "Intedados Pricing Enterprise",
+        "page_title": "Intedados Pricing Enterprise",
         "logo": "logo eirox.png",
-        "admin_title": "Gestão Eirox",
+        "admin_title": "Gestão Intedados",
         "about_page": "📌 Sobre a Intedados",
         "excel_brand": "EIROX PRICING ENTERPRISE",
         "data_dirs": {
@@ -462,8 +462,6 @@ EIROX_CLIENT_PROFILES = {
         },
     },
     "intedados": {
-        # A chave analítica permanece "carceres" de propósito:
-        # os dois deploys usam a MESMA assinatura, snapshot e regras de dados.
         "key": "carceres",
         "brand": "Intedados",
         "product": "Intedados Pricing Enterprise",
@@ -8045,7 +8043,7 @@ def eirox_enriquecer_pipeline_municipio(df_pesquisa, compra_base, estoque_base, 
 
 
 # EIROX PRICING 2.0 — FASE 7: NAVEGAÇÃO, FILTROS E EXPORTAÇÃO GLOBAL.
-VERSAO_APP = "Enterprise 2.0 — Fase 8.21 — Referência Única de Dados"
+VERSAO_APP = "Enterprise 2.0 — Fase 8.19 — Unidade Numeral Forçada"
 
 # --------------------------------------------------
 # FORMATACAO BRASIL
@@ -11269,7 +11267,7 @@ def enviar_alerta_localizacao_capturada():
         ambiente = "Streamlit Cloud" if "/mount/src" in str(Path.cwd()) else "Localhost"
 
         mensagem = (
-            "📍 <b>Localização capturada no Intedados Pricing</b>\n\n"
+            "📍 <b>Localização capturada no Eirox Pricing</b>\n\n"
             f"👤 <b>Usuário:</b> {usuario}\n"
             f"🙋 <b>Nome:</b> {nome}\n"
             f"🔐 <b>Perfil:</b> {perfil}\n"
@@ -11303,7 +11301,7 @@ def registrar_alerta_login(usuario, nome, perfil):
         ambiente = "Streamlit Cloud" if "/mount/src" in str(Path.cwd()) else "Localhost"
 
         mensagem = (
-            "🚀 <b>Novo acesso no Intedados Pricing</b>\n\n"
+            "🚀 <b>Novo acesso no Eirox Pricing</b>\n\n"
             f"👤 <b>Usuário:</b> {usuario}\n"
             f"🙋 <b>Nome:</b> {nome}\n"
             f"🔐 <b>Perfil:</b> {perfil}\n"
@@ -11340,7 +11338,7 @@ def registrar_alerta_navegacao_async(pagina):
         ambiente = "Streamlit Cloud" if "/mount/src" in str(Path.cwd()) else "Localhost"
 
         mensagem = (
-            "🧭 <b>Navegação no Intedados Pricing</b>\n\n"
+            "🧭 <b>Navegação no Eirox Pricing</b>\n\n"
             f"👤 <b>Usuário:</b> {usuario}\n"
             f"🙋 <b>Nome:</b> {nome}\n"
             f"🔐 <b>Perfil:</b> {perfil}\n"
@@ -11646,7 +11644,7 @@ def gerar_backup_eirox(nome_manual=""):
 
         try:
             enviar_alerta_telegram(
-                "📦 <b>Backup gerado no Intedados Pricing</b>\\n\\n"
+                "📦 <b>Backup gerado no Eirox Pricing</b>\\n\\n"
                 f"📄 <b>Arquivo:</b> {zip_path.name}\\n"
                 f"📦 <b>Tamanho:</b> {_backup_tamanho_formatado(tamanho)}\\n"
                 f"✅ <b>Itens incluídos:</b> {len(itens_incluidos)}\\n"
@@ -14494,7 +14492,7 @@ def filtrar_paginas_por_plano(paginas):
 
         plano = plano_empresa_contexto()
 
-        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre o Eirox', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Central de Qualidade', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
+        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a Intedados', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Central de Qualidade', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
 
         # Garante que todas as páginas de cliente existentes entrem no menu conforme o plano.
         todas_paginas_cliente = ["⚖️ Cliente x Principal Concorrente", '🏢 Portal do Cliente', '📋 Workflow Comercial', '🤖 IA Pricing Enterprise', '🏢 Dashboard Executivo', '🌎 Mapa Geográfico de Concorrência', '🔎 Rede/Loja vs Concorrentes']
@@ -14528,7 +14526,7 @@ def dividir_menu_cliente_admin(paginas):
     try:
         paginas = list(paginas)
 
-        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre o Eirox', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
+        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a Intedados', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
 
         cliente = [p for p in paginas if p not in admin_pages]
         admin = [p for p in paginas if p in admin_pages]
@@ -16179,7 +16177,7 @@ def tela_login():
         st.markdown(
             """
             <div style="text-align:center; margin-top:2px; margin-bottom:12px;">
-                <h1 style="font-size:1.70rem;line-height:1.08;margin:0 0 7px 0;">Intedados Pricing</h1>
+                <h1 style="font-size:1.70rem;line-height:1.08;margin:0 0 7px 0;">Eirox Pricing</h1>
                 <div style="font-size:1.03rem;font-weight:400;color:#B7C7D8;line-height:1.2;">
                     Inteligência de Pricing para Drogarias
                 </div>
@@ -25924,7 +25922,7 @@ if pagina == "🧭 Roadmap do Produto":
         <div class="eirox-hero">
             <div class="eirox-section-title">Product Strategy</div>
             <h1>🧭 Roadmap do Produto</h1>
-            <p>Plano evolutivo da plataforma Eirox Pricing Enterprise.</p>
+            <p>Plano evolutivo da plataforma Intedados Pricing Enterprise.</p>
         """,
         unsafe_allow_html=True
     )
@@ -26676,7 +26674,7 @@ if pagina == "📦 Backup Center":
         <div class="eirox-hero">
             <div class="eirox-section-title">Proteção e Recuperação</div>
             <h1>📦 Backup Center</h1>
-            <p>Geração, controle, histórico e download de backups oficiais do Eirox Pricing Enterprise.</p>
+            <p>Geração, controle, histórico e download de backups oficiais do Intedados Pricing Enterprise.</p>
         """,
         unsafe_allow_html=True
     )
@@ -37251,79 +37249,5 @@ div[data-testid="element-container"]:has(div[data-testid="stImage"]) {
     padding-top: 0 !important;
     padding-bottom: 0 !important;
 }
-</style>
-""", unsafe_allow_html=True)
-
-# ============================================================
-# INTEDADOS — IDENTIDADE VISUAL GLOBAL
-# Camada final de marca. Não altera regras de negócio.
-# Paleta derivada da logo oficial Intedados.
-# ============================================================
-st.markdown("""
-<style id="intedados-brand-global">
-:root {
-  --if-cyan:#00C6FF;
-  --if-blue:#0066FF;
-  --if-violet:#7B2CFF;
-  --if-purple:#B64DFF;
-  --if-bg:#050817;
-  --if-panel:#0B1230;
-  --if-panel2:#111A3D;
-  --if-text:#F7FAFF;
-  --if-muted:#AAB9D8;
-  --if-border:rgba(73,122,255,.28);
-}
-html, body, [data-testid="stAppViewContainer"], .stApp {
-  background:
-    radial-gradient(circle at 86% 6%, rgba(0,198,255,.10), transparent 28%),
-    radial-gradient(circle at 72% 92%, rgba(123,44,255,.10), transparent 30%),
-    linear-gradient(180deg,#050817 0%,#070D20 48%,#080B1B 100%) !important;
-  color:var(--if-text) !important;
-}
-section[data-testid="stSidebar"] {
-  background:
-    radial-gradient(circle at 50% 0%,rgba(0,198,255,.13),transparent 24%),
-    linear-gradient(180deg,#0B1636 0%,#090D25 56%,#070919 100%) !important;
-  border-right:1px solid rgba(74,103,255,.30) !important;
-}
-div[data-testid="stMetric"] {
-  background:linear-gradient(145deg,rgba(16,27,67,.97),rgba(8,14,38,.98)) !important;
-  border:1px solid var(--if-border) !important;
-  box-shadow:0 14px 32px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.025) !important;
-}
-div[data-testid="stMetric"]::before {
-  background:linear-gradient(90deg,var(--if-cyan),var(--if-blue) 48%,var(--if-violet),var(--if-purple)) !important;
-}
-.stButton > button, .stDownloadButton > button {
-  border-color:rgba(0,198,255,.40) !important;
-  background:linear-gradient(135deg,rgba(0,102,255,.16),rgba(123,44,255,.13)) !important;
-}
-.stButton > button:hover, .stDownloadButton > button:hover {
-  border-color:var(--if-cyan) !important;
-  box-shadow:0 0 20px rgba(0,198,255,.12) !important;
-}
-div[data-baseweb="select"] > div,
-div[data-testid="stTextInput"] input,
-div[data-testid="stNumberInput"] input {
-  background:#090F29 !important;
-  border-color:rgba(78,117,255,.30) !important;
-}
-[data-testid="stDataFrame"], [data-testid="stTable"], div[data-testid="stPlotlyChart"], div[data-testid="stExpander"] {
-  border-color:rgba(73,122,255,.24) !important;
-  background:linear-gradient(145deg,rgba(12,22,55,.92),rgba(7,12,31,.96)) !important;
-}
-a, [data-testid="stMarkdownContainer"] a { color:#45D8FF !important; }
-.eirox-dash-hero-v1420, .eirox-hero, .hero-eirox, .hero-pricing {
-  border-color:rgba(73,122,255,.30) !important;
-  background:
-    radial-gradient(circle at 92% 12%,rgba(0,198,255,.13),transparent 32%),
-    radial-gradient(circle at 68% 105%,rgba(123,44,255,.15),transparent 35%),
-    linear-gradient(135deg,rgba(12,22,57,.98),rgba(6,10,28,.98)) !important;
-}
-.eirox-dash-hero-v1420::before {
-  background:linear-gradient(180deg,var(--if-cyan),var(--if-blue) 42%,var(--if-violet),var(--if-purple)) !important;
-}
-.eirox-dash-eyebrow-v1420, .eirox-section-title, .eirox-hero-kicker { color:#45D8FF !important; }
-/* A logo continua governada pelo Brand System centralizado existente. */
 </style>
 """, unsafe_allow_html=True)
