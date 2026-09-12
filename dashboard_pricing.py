@@ -322,35 +322,186 @@ def eirox_v146_ultimo_mes_fechado():
 
 
 
+
+# ==========================================================
+# V8.26 — ÚLTIMA VENDA REAL DO PRINCIPAL
+# Fonte diária oficial: ULTIMA_VENDA_PRINCIPAL/Última venda do sistema.xlsx
+# ==========================================================
+def eirox_v826_ultima_venda_sistema():
+    """
+    Retorna a última venda REAL do Principal por EAN.
+
+    Fonte:
+      ULTIMA_VENDA_PRINCIPAL/Última venda do sistema.xlsx
+
+    Regra:
+      - normaliza o EAN;
+      - considera somente data_ultima_venda válida;
+      - considera somente ultimo_preco_vendido > 0;
+      - ordena por data_ultima_venda e vendaid;
+      - mantém somente a venda mais recente do EAN em toda a rede.
+
+    O arquivo pode ser substituído diariamente mantendo o mesmo nome.
+    O performance_engine invalida automaticamente o cache quando tamanho
+    ou data de modificação do arquivo mudar.
+    """
+    vazio = pd.DataFrame(columns=[
+        "EAN",
+        "Preco_Ultima_Venda_Sistema",
+        "Data_Ultima_Venda_Sistema",
+        "Loja_Ultima_Venda_Sistema",
+        "VendaID_Ultima_Venda_Sistema",
+        "Arquivo_Ultima_Venda_Sistema",
+    ])
+
+    caminho = (
+        Path(__file__).resolve().parent
+        / "ULTIMA_VENDA_PRINCIPAL"
+        / "Última venda do sistema.xlsx"
+    )
+
+    if not caminho.exists():
+        return vazio
+
+    try:
+        from performance_engine import ler_arquivo_cacheado
+        base = ler_arquivo_cacheado(caminho, header=0)
+    except Exception:
+        try:
+            base = pd.read_excel(caminho, sheet_name="Export")
+        except Exception:
+            return vazio
+
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return vazio
+
+    d = base.copy()
+
+    c_ean = _col(d, ["ean", "EAN", "EAN (GTIN)", "GTIN", "codigobarras"])
+    c_data = _col(d, ["data_ultima_venda", "Data Última Venda", "Data_Ultima_Venda"])
+    c_preco = _col(d, ["ultimo_preco_vendido", "Último Preço Vendido", "Preco_Ultima_Venda"])
+    c_loja = _col(d, ["loja", "Loja"])
+    c_vendaid = _col(d, ["vendaid", "VendaID", "Venda ID"])
+
+    if c_ean is None or c_data is None or c_preco is None:
+        return vazio
+
+    d["EAN"] = _ean(d[c_ean])
+    d["Preco_Ultima_Venda_Sistema"] = _num(d[c_preco])
+    d["Data_Ultima_Venda_Sistema"] = pd.to_datetime(
+        d[c_data], errors="coerce", dayfirst=True
+    )
+    d["Loja_Ultima_Venda_Sistema"] = (
+        d[c_loja].fillna("").astype(str) if c_loja else ""
+    )
+    d["VendaID_Ultima_Venda_Sistema"] = (
+        pd.to_numeric(d[c_vendaid], errors="coerce") if c_vendaid else np.nan
+    )
+    d["Arquivo_Ultima_Venda_Sistema"] = caminho.name
+
+    d = d[
+        d["EAN"].ne("")
+        & d["Data_Ultima_Venda_Sistema"].notna()
+        & d["Preco_Ultima_Venda_Sistema"].notna()
+        & d["Preco_Ultima_Venda_Sistema"].gt(0)
+    ].copy()
+
+    if d.empty:
+        return vazio
+
+    d["_ordem_v826"] = np.arange(len(d))
+    d = d.sort_values(
+        [
+            "EAN",
+            "Data_Ultima_Venda_Sistema",
+            "VendaID_Ultima_Venda_Sistema",
+            "_ordem_v826",
+        ],
+        ascending=[True, True, True, True],
+        kind="stable",
+        na_position="first",
+    )
+    d = d.groupby("EAN", sort=False).tail(1)
+
+    return d[vazio.columns].reset_index(drop=True)
+
+
 def eirox_v146_preco_principal():
     """
-    Prioridade:
-      1) VENDA_TESTE: última Data Emissão do Principal por EAN.
-      2) Se o EAN não existir ali: VENDA_FINAL_TESTE, último mês fechado,
+    V8.26 — hierarquia oficial do Preço Atual do Principal:
+
+      1) ULTIMA_VENDA_PRINCIPAL/Última venda do sistema.xlsx
+         -> maior data_ultima_venda por EAN
+         -> usa ultimo_preco_vendido;
+
+      2) se o EAN não existir no arquivo diário:
+         VENDA_TESTE -> última Data Emissão válida do Principal;
+
+      3) se ainda não existir:
+         VENDA_FINAL_TESTE -> último mês fechado com venda válida,
          Preço de Venda = Venda / Itens.
+
+    Nenhuma dessas fontes altera as bases originais.
     """
+    sistema = eirox_v826_ultima_venda_sistema()
     pesquisa = eirox_v143_ultima_pesquisa()
     fechado = eirox_v146_ultimo_mes_fechado()
 
     eans = set()
-    if isinstance(pesquisa, pd.DataFrame) and not pesquisa.empty:
-        eans.update(pesquisa["EAN"].astype(str))
-    if isinstance(fechado, pd.DataFrame) and not fechado.empty:
-        eans.update(fechado["EAN"].astype(str))
+    for fonte_df in (sistema, pesquisa, fechado):
+        if isinstance(fonte_df, pd.DataFrame) and not fonte_df.empty and "EAN" in fonte_df.columns:
+            eans.update(fonte_df["EAN"].astype(str))
+
     if not eans:
         return pd.DataFrame(columns=[
-            "EAN","Preco_Principal_Final","Fonte_Preco_Principal",
-            "Data_Ultima_Venda","Mes_Fechado_Referencia"
+            "EAN",
+            "Preco_Principal_Final",
+            "Fonte_Preco_Principal",
+            "Data_Ultima_Venda",
+            "Loja_Ultima_Venda",
+            "VendaID_Ultima_Venda",
+            "Arquivo_Ultima_Venda",
+            "Mes_Fechado_Referencia",
         ])
 
     out = pd.DataFrame({"EAN": sorted(eans)})
+
+    # 1) Arquivo diário oficial.
+    if isinstance(sistema, pd.DataFrame) and not sistema.empty:
+        s = sistema.drop_duplicates("EAN", keep="last").copy()
+        out = out.merge(s, on="EAN", how="left")
+    else:
+        out["Preco_Ultima_Venda_Sistema"] = np.nan
+        out["Data_Ultima_Venda_Sistema"] = pd.NaT
+        out["Loja_Ultima_Venda_Sistema"] = ""
+        out["VendaID_Ultima_Venda_Sistema"] = np.nan
+        out["Arquivo_Ultima_Venda_Sistema"] = ""
+
+    # 2) Pesquisa do Principal, apenas fallback.
     if isinstance(pesquisa, pd.DataFrame) and not pesquisa.empty:
-        p = pesquisa[["EAN","Preco_Ultima_Venda","Data_Ultima_Venda"]].drop_duplicates("EAN", keep="last")
+        p = pesquisa[
+            [
+                "EAN",
+                "Preco_Ultima_Venda",
+                "Data_Ultima_Venda",
+                "Loja_Ultima_Venda",
+                "Arquivo_Ultima_Venda",
+            ]
+        ].drop_duplicates("EAN", keep="last").copy()
+        p = p.rename(columns={
+            "Preco_Ultima_Venda": "Preco_Fallback_Pesquisa_Principal",
+            "Data_Ultima_Venda": "Data_Fallback_Pesquisa_Principal",
+            "Loja_Ultima_Venda": "Loja_Fallback_Pesquisa_Principal",
+            "Arquivo_Ultima_Venda": "Arquivo_Fallback_Pesquisa_Principal",
+        })
         out = out.merge(p, on="EAN", how="left")
     else:
-        out["Preco_Ultima_Venda"] = np.nan
-        out["Data_Ultima_Venda"] = pd.NaT
+        out["Preco_Fallback_Pesquisa_Principal"] = np.nan
+        out["Data_Fallback_Pesquisa_Principal"] = pd.NaT
+        out["Loja_Fallback_Pesquisa_Principal"] = ""
+        out["Arquivo_Fallback_Pesquisa_Principal"] = ""
 
+    # 3) Último mês fechado.
     if isinstance(fechado, pd.DataFrame) and not fechado.empty:
         f = fechado.drop_duplicates("EAN", keep="last")
         out = out.merge(f, on="EAN", how="left")
@@ -358,23 +509,86 @@ def eirox_v146_preco_principal():
         out["Preco_Fallback_Mes_Fechado"] = np.nan
         out["Mes_Fechado_Referencia"] = ""
 
-    real = pd.to_numeric(out["Preco_Ultima_Venda"], errors="coerce")
-    fb = pd.to_numeric(out["Preco_Fallback_Mes_Fechado"], errors="coerce")
-    out["Preco_Principal_Final"] = real.where(real.notna() & real.gt(0), fb)
-    out["Fonte_Preco_Principal"] = np.where(
-        real.notna() & real.gt(0),
-        "ÚLTIMA VENDA",
-        np.where(fb.notna() & fb.gt(0), "ÚLTIMO MÊS FECHADO", "SEM PREÇO")
+    ps = pd.to_numeric(out["Preco_Ultima_Venda_Sistema"], errors="coerce")
+    pp = pd.to_numeric(out["Preco_Fallback_Pesquisa_Principal"], errors="coerce")
+    pf = pd.to_numeric(out["Preco_Fallback_Mes_Fechado"], errors="coerce")
+
+    usa_sistema = ps.notna() & ps.gt(0)
+    usa_pesquisa = (~usa_sistema) & pp.notna() & pp.gt(0)
+    usa_fechado = (~usa_sistema) & (~usa_pesquisa) & pf.notna() & pf.gt(0)
+
+    out["Preco_Principal_Final"] = np.select(
+        [usa_sistema, usa_pesquisa, usa_fechado],
+        [ps, pp, pf],
+        default=np.nan,
     )
+
+    # Mantém o rótulo "ÚLTIMA VENDA" para compatibilidade com telas e relatórios.
+    # A origem detalhada fica em Fonte_Detalhada_Preco_Principal.
+    out["Fonte_Preco_Principal"] = np.select(
+        [usa_sistema, usa_pesquisa, usa_fechado],
+        ["ÚLTIMA VENDA", "ÚLTIMA VENDA", "ÚLTIMO MÊS FECHADO"],
+        default="SEM PREÇO",
+    )
+
+    out["Fonte_Detalhada_Preco_Principal"] = np.select(
+        [usa_sistema, usa_pesquisa, usa_fechado],
+        [
+            "ARQUIVO DIÁRIO — ÚLTIMA VENDA DO SISTEMA",
+            "VENDA_TESTE — ÚLTIMA PESQUISA PRINCIPAL",
+            "VENDA_FINAL_TESTE — ÚLTIMO MÊS FECHADO",
+        ],
+        default="SEM PREÇO",
+    )
+
+    out["Data_Ultima_Venda"] = pd.to_datetime(
+        out["Data_Ultima_Venda_Sistema"], errors="coerce"
+    )
+    out.loc[usa_pesquisa, "Data_Ultima_Venda"] = pd.to_datetime(
+        out.loc[usa_pesquisa, "Data_Fallback_Pesquisa_Principal"],
+        errors="coerce",
+    )
+
+    out["Loja_Ultima_Venda"] = ""
+    out.loc[usa_sistema, "Loja_Ultima_Venda"] = (
+        out.loc[usa_sistema, "Loja_Ultima_Venda_Sistema"]
+        .fillna("")
+        .astype(str)
+    )
+    out.loc[usa_pesquisa, "Loja_Ultima_Venda"] = (
+        out.loc[usa_pesquisa, "Loja_Fallback_Pesquisa_Principal"]
+        .fillna("")
+        .astype(str)
+    )
+
+    out["VendaID_Ultima_Venda"] = np.where(
+        usa_sistema,
+        out["VendaID_Ultima_Venda_Sistema"],
+        np.nan,
+    )
+
+    out["Arquivo_Ultima_Venda"] = ""
+    out.loc[usa_sistema, "Arquivo_Ultima_Venda"] = (
+        out.loc[usa_sistema, "Arquivo_Ultima_Venda_Sistema"]
+        .fillna("")
+        .astype(str)
+    )
+    out.loc[usa_pesquisa, "Arquivo_Ultima_Venda"] = (
+        out.loc[usa_pesquisa, "Arquivo_Fallback_Pesquisa_Principal"]
+        .fillna("")
+        .astype(str)
+    )
+
     return out
 
 
 
 def eirox_v143_aplicar_preco(base):
     """
-    V1.4.47 — Preço Atual:
-    1) VENDA_TESTE pela última Data Emissão do Principal;
-    2) se não houver EAN, VENDA_FINAL_TESTE do último mês fechado,
+    V8.26 — Preço Atual:
+    1) arquivo diário "Última venda do sistema.xlsx", pela venda real mais recente;
+    2) se não houver EAN, VENDA_TESTE pela última Data Emissão do Principal;
+    3) se ainda não houver, VENDA_FINAL_TESTE do último mês fechado,
        calculando Venda / Itens.
     """
     if not isinstance(base, pd.DataFrame) or base.empty:
@@ -393,11 +607,19 @@ def eirox_v143_aplicar_preco(base):
         fonte = keys.map(lk["Fonte_Preco_Principal"])
         data = keys.map(lk["Data_Ultima_Venda"])
         mes = keys.map(lk["Mes_Fechado_Referencia"])
+        loja = keys.map(lk["Loja_Ultima_Venda"]) if "Loja_Ultima_Venda" in lk.columns else pd.Series("", index=d.index)
+        vendaid = keys.map(lk["VendaID_Ultima_Venda"]) if "VendaID_Ultima_Venda" in lk.columns else pd.Series(np.nan, index=d.index)
+        arquivo_uv = keys.map(lk["Arquivo_Ultima_Venda"]) if "Arquivo_Ultima_Venda" in lk.columns else pd.Series("", index=d.index)
+        fonte_detalhada = keys.map(lk["Fonte_Detalhada_Preco_Principal"]) if "Fonte_Detalhada_Preco_Principal" in lk.columns else fonte
     else:
         final = pd.Series(np.nan,index=d.index,dtype="float64")
         fonte = pd.Series("SEM PREÇO",index=d.index,dtype="object")
         data = pd.Series(pd.NaT,index=d.index)
         mes = pd.Series("",index=d.index,dtype="object")
+        loja = pd.Series("",index=d.index,dtype="object")
+        vendaid = pd.Series(np.nan,index=d.index,dtype="float64")
+        arquivo_uv = pd.Series("",index=d.index,dtype="object")
+        fonte_detalhada = pd.Series("SEM PREÇO",index=d.index,dtype="object")
 
     # Mantém referência anterior separada para auditoria/cálculos.
     ref = pd.Series(np.nan, index=d.index, dtype="float64")
@@ -414,7 +636,11 @@ def eirox_v143_aplicar_preco(base):
     d["Preco_Ultima_Venda"] = pd.to_numeric(final, errors="coerce")
     d["Data_Ultima_Venda"] = data
     d["Mes_Fechado_Referencia"] = mes
+    d["Loja_Ultima_Venda"] = loja.fillna("").astype(str)
+    d["VendaID_Ultima_Venda"] = pd.to_numeric(vendaid, errors="coerce")
+    d["Arquivo_Ultima_Venda"] = arquivo_uv.fillna("").astype(str)
     d["Fonte_Preço_Eirox"] = fonte.fillna("SEM PREÇO")
+    d["Fonte_Detalhada_Preço_Eirox"] = fonte_detalhada.fillna("SEM PREÇO")
     return d
 
 
@@ -448,11 +674,11 @@ EIROX_CLIENT_PROFILES = {
     "carceres": {
         "key": "carceres",
         "brand": "Eirox",
-        "product": "Intedados Pricing Enterprise",
-        "page_title": "Intedados Pricing Enterprise",
+        "product": "Eirox Pricing Enterprise",
+        "page_title": "Eirox Pricing Enterprise",
         "logo": "logo eirox.png",
-        "admin_title": "Gestão Intedados",
-        "about_page": "📌 Sobre a Intedados",
+        "admin_title": "Gestão Eirox",
+        "about_page": "📌 Sobre o Eirox",
         "excel_brand": "EIROX PRICING ENTERPRISE",
         "data_dirs": {
             "historico": "VENDA_TESTE",
@@ -461,15 +687,15 @@ EIROX_CLIENT_PROFILES = {
             "compra": "COMPRA_TESTE",
         },
     },
-    "intedados": {
-        "key": "carceres",
-        "brand": "Intedados",
-        "product": "Intedados Pricing Enterprise",
-        "page_title": "Intedados Pricing Enterprise",
-        "logo": "logo intedados.png",
-        "admin_title": "Gestão Intedados",
-        "about_page": "📌 Sobre a Intedados",
-        "excel_brand": "INTEDADOS PRICING ENTERPRISE",
+    "insightfarma": {
+        "key": "insightfarma",
+        "brand": "InsightFarma",
+        "product": "InsightFarma Pricing Enterprise",
+        "page_title": "InsightFarma Pricing Enterprise",
+        "logo": "logo insightfarma.png",
+        "admin_title": "Gestão InsightFarma",
+        "about_page": "📌 Sobre a InsightFarma",
+        "excel_brand": "INSIGHTFARMA PRICING ENTERPRISE",
         "data_dirs": {
             "historico": "VENDA_TESTE",
             "venda": "VENDA_FINAL_TESTE",
@@ -479,7 +705,7 @@ EIROX_CLIENT_PROFILES = {
     },
 }
 
-EIROX_CLIENT_KEY = "intedados"
+EIROX_CLIENT_KEY = "carceres"
 EIROX_CLIENT_PROFILE = EIROX_CLIENT_PROFILES[EIROX_CLIENT_KEY]
 
 
@@ -3715,7 +3941,7 @@ def eirox_render_header_premium():
     st.markdown(
         f"""
         <div class="eirox-hero-premium">
-            <div class="eirox-hero-kicker">Intedados Pricing Enterprise</div>
+            <div class="eirox-hero-kicker">Eirox Pricing Enterprise</div>
             <h1 class="eirox-hero-title">Cockpit Executivo de Pricing</h1>
             <div class="eirox-hero-subtitle">
                 Cliente: <b>{cliente}</b> · Última atualização: <b>{agora}</b>
@@ -7825,7 +8051,7 @@ def eirox_menu_unico_sidebar(paginas_cliente, paginas_admin, plano_atual):
             st.markdown(
                 """
                 <div class="eirox-menu-kicker-v1422 eirox-admin-kicker-v1422">Área Administrativa</div>
-                <div class="eirox-menu-title-v1422">Gestão Intedados</div>
+                <div class="eirox-menu-title-v1422">Gestão Eirox</div>
                 <div class="eirox-menu-sub-v1422">Administração, segurança e operação</div>
                 """,
                 unsafe_allow_html=True,
@@ -12172,7 +12398,7 @@ DESCRICOES_TELAS_ENTERPRISE = {
     "🟢 Saúde do Sistema": "Monitoramento operacional do ambiente, performance, integridade das bases e integrações.",
     "📦 Backup Center": "Gerenciamento de backups, restauração e proteção das informações críticas do sistema.",
     "🏢 Multiempresa": "Administração de empresas, segregação de dados e preparação do ambiente SaaS.",
-    "📌 Sobre a Intedados": "Informações institucionais, propósito da plataforma e visão geral do produto.",
+    "📌 Sobre o Eirox": "Informações institucionais, propósito da plataforma e visão geral do produto.",
     "🧭 Roadmap do Produto": "Plano evolutivo da plataforma, módulos concluídos, próximos ciclos e prioridades.",
     "💼 Licenciamento Multiempresa": "Modelo comercial, planos de uso, governança de clientes e expansão SaaS.",
     "💼 Licenciamento Real": "Controle real de planos, expiração, limites de usuários, lojas e bloqueio de licença.",
@@ -14412,7 +14638,7 @@ TELAS_ADMIN_EIROX = [
     "💼 Licenciamento Real",
     "🏢 CRM Enterprise",
     "🏁 Release Candidate",
-    "📌 Sobre a Intedados",
+    "📌 Sobre o Eirox",
     "🧭 Roadmap do Produto",
     "🧪 Diagnóstico",
     "💳 Billing Enterprise"]
@@ -14492,7 +14718,7 @@ def filtrar_paginas_por_plano(paginas):
 
         plano = plano_empresa_contexto()
 
-        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a Intedados', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Central de Qualidade', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
+        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre o Eirox', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Central de Qualidade', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
 
         # Garante que todas as páginas de cliente existentes entrem no menu conforme o plano.
         todas_paginas_cliente = ["⚖️ Cliente x Principal Concorrente", '🏢 Portal do Cliente', '📋 Workflow Comercial', '🤖 IA Pricing Enterprise', '🏢 Dashboard Executivo', '🌎 Mapa Geográfico de Concorrência', '🔎 Rede/Loja vs Concorrentes']
@@ -14520,13 +14746,13 @@ def filtrar_paginas_por_plano(paginas):
 
 def dividir_menu_cliente_admin(paginas):
     """
-    Separa menu em Área do Cliente e Administração Intedados.
+    Separa menu em Área do Cliente e Administração Eirox.
     """
 
     try:
         paginas = list(paginas)
 
-        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre a Intedados', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
+        admin_pages = ['🏁 Release Candidate', '🏢 CRM Enterprise', '🏢 Multiempresa', '👥 Controle de Usuários', '💳 Billing Enterprise', '💼 Licenciamento Multiempresa', '💼 Licenciamento Real', '📌 Sobre o Eirox', '📦 Backup Center', '🔐 Central de Auditoria', '🟢 Saúde do Sistema', '🧪 Diagnóstico', '🧭 Roadmap do Produto']
 
         cliente = [p for p in paginas if p not in admin_pages]
         admin = [p for p in paginas if p in admin_pages]
@@ -14805,7 +15031,7 @@ def portal_novidades():
     return pd.DataFrame(
         [
             {"Versão": "v1.39.1", "Novidade": "Portal do Cliente Enterprise", "Descrição": "Minha empresa, licença, uso, suporte e central de conhecimento."},
-            {"Versão": "v1.38.1", "Novidade": "Menu por plano", "Descrição": "Área do Cliente separada da Administração Intedados."},
+            {"Versão": "v1.38.1", "Novidade": "Menu por plano", "Descrição": "Área do Cliente separada da Administração Eirox."},
             {"Versão": "v1.38.0", "Novidade": "CRM Enterprise", "Descrição": "Gestão comercial de clientes, planos, MRR e implantação."},
             {"Versão": "v1.37.1", "Novidade": "Workflow Comercial", "Descrição": "Aprovação e rejeição de recomendações da IA."},
             {"Versão": "v1.37.0", "Novidade": "IA Pricing Enterprise", "Descrição": "Recomendações automáticas de preço."},
@@ -16360,7 +16586,7 @@ except:
 st.markdown(
     """
     <div class="eirox-hero" style="max-height:none !important;height:auto !important;overflow:visible !important;padding:10px 18px 11px 20px !important;margin-bottom:12px !important;">
-        <div class="eirox-section-title" style="font-size:0.68rem !important;line-height:1.05 !important;margin-bottom:5px !important;">Intedados Pricing Enterprise</div>
+        <div class="eirox-section-title" style="font-size:0.68rem !important;line-height:1.05 !important;margin-bottom:5px !important;">Eirox Pricing Enterprise</div>
         <h1 style="font-size:1.38rem !important;line-height:1.12 !important;margin:0 !important;padding:0 !important;">📊 Inteligência de Pricing & Competitividade</h1>
         <p style="font-size:0.80rem !important;line-height:1.2 !important;margin:5px 0 0 0 !important;">Monitoramento executivo de preços, concorrência, margem, alertas e oportunidades comerciais.</p>
     </div>
@@ -19309,7 +19535,7 @@ def eirox_v282_analise_prioritarios(prioridades, dados):
     )
     fonte = mapcol(["Fonte_Preço_Eirox","Fonte_Preco_Oficial"], "").fillna("").astype(str)
     out["Fonte Preço Atual"] = fonte.replace({
-        "ÚLTIMA VENDA": "VENDA_TESTE — ÚLTIMA PESQUISA PRINCIPAL",
+        "ÚLTIMA VENDA": "ARQUIVO DIÁRIO — ÚLTIMA VENDA DO SISTEMA",
         "ÚLTIMO MÊS FECHADO": "VENDA_FINAL_TESTE — ÚLTIMO MÊS FECHADO",
     })
 
@@ -20274,7 +20500,7 @@ if usuario_pode_ver_multiempresa() and "🏢 Multiempresa" not in paginas_libera
 
 if usuario_pode_ver_multiempresa():
     for pagina_enterprise in [
-        "📌 Sobre a Intedados",
+        "📌 Sobre o Eirox",
         "🧭 Roadmap do Produto",
         "💼 Licenciamento Multiempresa",
         "💼 Licenciamento Real",
@@ -23553,7 +23779,7 @@ def eirox_v147_corrigir_lista_subir_final(tab):
 
 
 
-    # V1.4.49 — barreira visual final com prioridade VENDA_TESTE e
+    # V8.26 — barreira visual final com prioridade no arquivo diário e
     # fallback VENDA_FINAL_TESTE do último mês fechado (Venda / Itens).
     try:
         _mapa = eirox_v146_preco_principal()
@@ -23602,9 +23828,10 @@ def eirox_v147_corrigir_lista_subir_final(tab):
 # EIROX PRICING 2.0 — V7.1
 # BARREIRA FINAL DO PREÇO ATUAL
 # ==========================================================
-# O Preço Atual pode ter somente duas origens:
-# 1) VENDA_TESTE — última pesquisa válida do CNPJ Principal;
-# 2) VENDA_FINAL_TESTE — Venda / Itens do último mês fechado com venda.
+# O Preço Atual possui a hierarquia V8.26:
+# 1) arquivo diário — última venda real do sistema;
+# 2) VENDA_TESTE — última pesquisa válida do CNPJ Principal;
+# 3) VENDA_FINAL_TESTE — Venda / Itens do último mês fechado com venda.
 # Sem uma dessas origens, o produto fica SEM PREÇO.
 _eirox_v147_legacy_corrigir_lista_subir_final = eirox_v147_corrigir_lista_subir_final
 
@@ -23662,7 +23889,7 @@ def eirox_v271_aplicar_preco_canonico_tabela(tab):
         ]
 
     out["Fonte Preço Atual"] = fonte.map({
-        "ÚLTIMA VENDA": "VENDA_TESTE — ÚLTIMA PESQUISA PRINCIPAL",
+        "ÚLTIMA VENDA": "ARQUIVO DIÁRIO — ÚLTIMA VENDA DO SISTEMA",
         "ÚLTIMO MÊS FECHADO": "VENDA_FINAL_TESTE — ÚLTIMO MÊS FECHADO",
         "SEM PREÇO": "SEM PREÇO",
     }).fillna("SEM PREÇO")
@@ -25841,9 +26068,9 @@ if pagina == "👥 Controle de Usuários":
 # SOBRE O EIROX ENTERPRISE
 # --------------------------------------------------
 
-if pagina == "📌 Sobre a Intedados":
+if pagina == "📌 Sobre o Eirox":
 
-    mostrar_explicacao_visao_eirox("📌 Sobre a Intedados")
+    mostrar_explicacao_visao_eirox("📌 Sobre o Eirox")
 
     if not usuario_pode_ver_multiempresa():
         st.error("Acesso não autorizado.")
@@ -25852,14 +26079,14 @@ if pagina == "📌 Sobre a Intedados":
     st.markdown(
         """
         <div class="eirox-hero">
-            <div class="eirox-section-title">Intedados Pricing Enterprise</div>
-            <h1>📌 Sobre a Intedados Enterprise</h1>
+            <div class="eirox-section-title">Eirox Pricing Enterprise</div>
+            <h1>📌 Sobre o Eirox Enterprise</h1>
             <p>Plataforma de inteligência de pricing, competitividade e governança para redes de farmácia.</p>
         """,
         unsafe_allow_html=True
     )
 
-    legenda_tela("📌 Sobre a Intedados")
+    legenda_tela("📌 Sobre o Eirox")
 
     c1, c2, c3 = st.columns(3)
 
@@ -25922,7 +26149,7 @@ if pagina == "🧭 Roadmap do Produto":
         <div class="eirox-hero">
             <div class="eirox-section-title">Product Strategy</div>
             <h1>🧭 Roadmap do Produto</h1>
-            <p>Plano evolutivo da plataforma Intedados Pricing Enterprise.</p>
+            <p>Plano evolutivo da plataforma Eirox Pricing Enterprise.</p>
         """,
         unsafe_allow_html=True
     )
@@ -26674,7 +26901,7 @@ if pagina == "📦 Backup Center":
         <div class="eirox-hero">
             <div class="eirox-section-title">Proteção e Recuperação</div>
             <h1>📦 Backup Center</h1>
-            <p>Geração, controle, histórico e download de backups oficiais do Intedados Pricing Enterprise.</p>
+            <p>Geração, controle, histórico e download de backups oficiais do Eirox Pricing Enterprise.</p>
         """,
         unsafe_allow_html=True
     )
@@ -33005,7 +33232,7 @@ st.markdown(
 st.markdown(
     f"""
     <section class="eirox-dash-hero-v1420">
-      <div class="eirox-dash-eyebrow-v1420">Intedados Pricing Enterprise · Visão Executiva</div>
+      <div class="eirox-dash-eyebrow-v1420">Eirox Pricing Enterprise · Visão Executiva</div>
       <h1 class="eirox-dash-title-v1420">Dashboard Geral</h1>
       <div class="eirox-dash-sub-v1420">
         Inteligência de pricing, competitividade e rentabilidade em uma visão única para apresentação e decisão executiva.
