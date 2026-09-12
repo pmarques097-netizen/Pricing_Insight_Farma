@@ -15,8 +15,8 @@ showErrorDetails = false
 
 [theme]
 base = "dark"
-primaryColor = "#0066FF"
-backgroundColor = "#050817"
-secondaryBackgroundColor = "#0B1230"
-textColor = "#F7FAFF"
+primaryColor = "#2CA0FF"
+backgroundColor = "#07111F"
+secondaryBackgroundColor = "#0B1B33"
+textColor = "#F3F7FF"
 font = "sans serif"
