@@ -1,1 +1,1 @@
-# Pricing_Insight_Farma
+# Intedados_Pricing
