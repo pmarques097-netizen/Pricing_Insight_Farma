@@ -337,7 +337,7 @@ def eirox_v826_ultima_venda_sistema():
     Regra:
       - normaliza o EAN;
       - considera somente data_ultima_venda válida;
-      - considera somente ultimo_preco_vendido > 0;
+      - calcula Preço Atual líquido = valor_total / quantidade;
       - ordena por data_ultima_venda e vendaid;
       - mantém somente a venda mais recente do EAN em toda a rede.
 
@@ -348,6 +348,9 @@ def eirox_v826_ultima_venda_sistema():
     vazio = pd.DataFrame(columns=[
         "EAN",
         "Preco_Ultima_Venda_Sistema",
+        "Preco_Tabela_Ultima_Venda_Sistema",
+        "Valor_Total_Ultima_Venda_Sistema",
+        "Quantidade_Ultima_Venda_Sistema",
         "Data_Ultima_Venda_Sistema",
         "Loja_Ultima_Venda_Sistema",
         "VendaID_Ultima_Venda_Sistema",
@@ -380,14 +383,40 @@ def eirox_v826_ultima_venda_sistema():
     c_ean = _col(d, ["ean", "EAN", "EAN (GTIN)", "GTIN", "codigobarras"])
     c_data = _col(d, ["data_ultima_venda", "Data Última Venda", "Data_Ultima_Venda"])
     c_preco = _col(d, ["ultimo_preco_vendido", "Último Preço Vendido", "Preco_Ultima_Venda"])
+    c_preco_tabela = _col(d, ["preco_tabela", "Preço Tabela", "Preco_Tabela"])
+    c_qtd = _col(d, ["quantidade", "Quantidade", "Qtd", "Qtd."])
+    c_total = _col(d, ["valor_total", "Valor Total", "Total", "Valor_Total"])
     c_loja = _col(d, ["loja", "Loja"])
     c_vendaid = _col(d, ["vendaid", "VendaID", "Venda ID"])
 
-    if c_ean is None or c_data is None or c_preco is None:
+    if c_ean is None or c_data is None:
         return vazio
 
     d["EAN"] = _ean(d[c_ean])
-    d["Preco_Ultima_Venda_Sistema"] = _num(d[c_preco])
+
+    # V8.27 — PREÇO ATUAL REAL/LÍQUIDO
+    # A7: Preço Atual = Total efetivamente vendido / Quantidade.
+    # Ex.: Total 70,00 / Qtd 2 = 35,00.
+    qtd_v827 = _num(d[c_qtd]) if c_qtd else pd.Series(np.nan, index=d.index)
+    total_v827 = _num(d[c_total]) if c_total else pd.Series(np.nan, index=d.index)
+    preco_liquido_v827 = total_v827 / qtd_v827.replace(0, np.nan)
+
+    # ultimo_preco_vendido fica apenas como fallback técnico quando o arquivo
+    # não trouxer Total/Quantidade válidos. preco_tabela nunca vira Preço Atual.
+    preco_exportado_v827 = (
+        _num(d[c_preco]) if c_preco else pd.Series(np.nan, index=d.index)
+    )
+    preco_final_v827 = preco_liquido_v827.where(
+        preco_liquido_v827.notna() & preco_liquido_v827.gt(0),
+        preco_exportado_v827,
+    )
+
+    d["Preco_Ultima_Venda_Sistema"] = preco_final_v827
+    d["Preco_Tabela_Ultima_Venda_Sistema"] = (
+        _num(d[c_preco_tabela]) if c_preco_tabela else np.nan
+    )
+    d["Valor_Total_Ultima_Venda_Sistema"] = total_v827
+    d["Quantidade_Ultima_Venda_Sistema"] = qtd_v827
     d["Data_Ultima_Venda_Sistema"] = pd.to_datetime(
         d[c_data], errors="coerce", dayfirst=True
     )
@@ -432,7 +461,7 @@ def eirox_v146_preco_principal():
 
       1) ULTIMA_VENDA_PRINCIPAL/Última venda do sistema.xlsx
          -> maior data_ultima_venda por EAN
-         -> usa ultimo_preco_vendido;
+         -> usa valor_total / quantidade da venda mais recente;
 
       2) se o EAN não existir no arquivo diário:
          VENDA_TESTE -> última Data Emissão válida do Principal;
@@ -534,7 +563,7 @@ def eirox_v146_preco_principal():
     out["Fonte_Detalhada_Preco_Principal"] = np.select(
         [usa_sistema, usa_pesquisa, usa_fechado],
         [
-            "ARQUIVO DIÁRIO — ÚLTIMA VENDA DO SISTEMA",
+            "ARQUIVO DIÁRIO — TOTAL / QUANTIDADE DA ÚLTIMA VENDA",
             "VENDA_TESTE — ÚLTIMA PESQUISA PRINCIPAL",
             "VENDA_FINAL_TESTE — ÚLTIMO MÊS FECHADO",
         ],
@@ -668,7 +697,7 @@ from zoneinfo import ZoneInfo
 # NÚCLEO MULTI-CLIENTE + PERFIL CENTRALIZADO
 # ==========================================================
 EIROX_CORE_VERSION = "2.0.8"
-EIROX_CORE_RULESET_ID = "EIROX-CORE-2.0.8-STRICT-PRICE-V7.1"
+EIROX_CORE_RULESET_ID = "EIROX-CORE-2.0.8-STRICT-PRICE-V8.28-LIQUID"
 
 EIROX_CLIENT_PROFILES = {
     "carceres": {
@@ -678,7 +707,7 @@ EIROX_CLIENT_PROFILES = {
         "page_title": "Eirox Pricing Enterprise",
         "logo": "logo eirox.png",
         "admin_title": "Gestão Eirox",
-        "about_page": "📌 Sobre o Eirox",
+        "about_page": "📌 Sobre a Intedados",
         "excel_brand": "EIROX PRICING ENTERPRISE",
         "data_dirs": {
             "historico": "VENDA_TESTE",
@@ -687,15 +716,17 @@ EIROX_CLIENT_PROFILES = {
             "compra": "COMPRA_TESTE",
         },
     },
-    "insightfarma": {
-        "key": "insightfarma",
-        "brand": "InsightFarma",
-        "product": "InsightFarma Pricing Enterprise",
-        "page_title": "InsightFarma Pricing Enterprise",
-        "logo": "logo insightfarma.png",
-        "admin_title": "Gestão InsightFarma",
-        "about_page": "📌 Sobre a InsightFarma",
-        "excel_brand": "INSIGHTFARMA PRICING ENTERPRISE",
+    "intedados": {
+        # A chave analítica permanece "carceres" de propósito:
+        # os dois deploys usam a MESMA assinatura, snapshot e regras de dados.
+        "key": "carceres",
+        "brand": "Intedados",
+        "product": "Intedados Pricing Enterprise",
+        "page_title": "Intedados Pricing Enterprise",
+        "logo": "logo intedados.png",
+        "admin_title": "Gestão Intedados",
+        "about_page": "📌 Sobre a Intedados",
+        "excel_brand": "INTEDADOS PRICING ENTERPRISE",
         "data_dirs": {
             "historico": "VENDA_TESTE",
             "venda": "VENDA_FINAL_TESTE",
@@ -705,7 +736,7 @@ EIROX_CLIENT_PROFILES = {
     },
 }
 
-EIROX_CLIENT_KEY = "carceres"
+EIROX_CLIENT_KEY = "intedados"
 EIROX_CLIENT_PROFILE = EIROX_CLIENT_PROFILES[EIROX_CLIENT_KEY]
 
 
@@ -1941,6 +1972,42 @@ def normalizar_cnpj_eirox(valor):
         return ""
 
 
+def normalizar_cnpj_eirox_serie(serie):
+    """V8.29 PERFORMANCE: normalização vetorizada, sem .apply linha a linha."""
+    try:
+        s = serie.astype("string").fillna("").str.replace(r"\D", "", regex=True)
+        s = s.where(s.ne("") & s.ne("0"), "")
+        mask = s.ne("")
+        s = s.where(~mask, s.str.zfill(14))
+        return s.astype(str)
+    except Exception:
+        return pd.Series("", index=getattr(serie, "index", None), dtype=str)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _carregar_cnpjs_cliente_cacheado(caminho_str, assinatura):
+    try:
+        caminho = Path(caminho_str)
+        try:
+            cadastro = pd.read_csv(
+                caminho, sep=";", dtype=str, encoding="utf-8-sig"
+            )
+        except Exception:
+            cadastro = pd.read_csv(
+                caminho, dtype=str, encoding="utf-8-sig"
+            )
+
+        if cadastro.empty or "CNPJ" not in cadastro.columns:
+            return set(), cadastro
+
+        cadastro["CNPJ_Limpo"] = normalizar_cnpj_eirox_serie(cadastro["CNPJ"])
+        cnpjs = set(cadastro["CNPJ_Limpo"].dropna().astype(str).str.strip())
+        cnpjs = {c for c in cnpjs if c and c != "00000000000000"}
+        return cnpjs, cadastro
+    except Exception:
+        return set(), pd.DataFrame()
+
+
 def carregar_cnpjs_cliente():
     try:
         if not ARQUIVO_CADASTRO_CNPJ_CLIENTE.exists():
@@ -1960,32 +2027,14 @@ def carregar_cnpjs_cliente():
                 encoding="utf-8-sig"
             )
 
-        try:
-            cadastro = pd.read_csv(
-                ARQUIVO_CADASTRO_CNPJ_CLIENTE,
-                sep=";",
-                dtype=str,
-                encoding="utf-8-sig"
-            )
-        except Exception:
-            cadastro = pd.read_csv(
-                ARQUIVO_CADASTRO_CNPJ_CLIENTE,
-                dtype=str,
-                encoding="utf-8-sig"
-            )
-
-        if cadastro.empty or "CNPJ" not in cadastro.columns:
-            return set(), cadastro
-
-        cadastro["CNPJ_Limpo"] = cadastro["CNPJ"].apply(normalizar_cnpj_eirox)
-        cnpjs = set(cadastro["CNPJ_Limpo"].dropna().astype(str).str.strip())
-        cnpjs = {c for c in cnpjs if c and c != "00000000000000"}
-
-        return cnpjs, cadastro
-
+        return _carregar_cnpjs_cliente_cacheado(
+            str(ARQUIVO_CADASTRO_CNPJ_CLIENTE.resolve()),
+            _assinatura_arquivo_cadastro_eirox(ARQUIVO_CADASTRO_CNPJ_CLIENTE)
+            if "_assinatura_arquivo_cadastro_eirox" in globals()
+            else str(ARQUIVO_CADASTRO_CNPJ_CLIENTE.stat().st_mtime_ns),
+        )
     except Exception:
         return set(), pd.DataFrame()
-
 
 def encontrar_coluna_cnpj_cliente(base):
     try:
@@ -2027,7 +2076,7 @@ def aplicar_classificacao_cliente_concorrente(base, nome_base=""):
             base["CNPJ_Limpo"] = ""
             return base
 
-        base["CNPJ_Limpo"] = base[col_cnpj].apply(normalizar_cnpj_eirox)
+        base["CNPJ_Limpo"] = normalizar_cnpj_eirox_serie(base[col_cnpj])
 
         base["Tipo_Estabelecimento"] = np.where(
             base["CNPJ_Limpo"].isin(cnpjs_cliente),
@@ -2069,10 +2118,19 @@ ARQ_CLIENTE_CNPJS = Path("CADASTRO_CLIENTE_CNPJS.csv")
 ARQ_USUARIOS_CLIENTES = Path("CADASTRO_USUARIOS_CLIENTES.csv")
 
 
-def _ler_csv_cadastro_eirox(caminho, colunas):
+def _assinatura_arquivo_cadastro_eirox(caminho):
     try:
-        if not caminho.exists():
-            pd.DataFrame(columns=colunas).to_csv(caminho, index=False, sep=";", encoding="utf-8-sig")
+        stt = caminho.stat()
+        return f"{stt.st_size}:{stt.st_mtime_ns}"
+    except Exception:
+        return "0:0"
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _ler_csv_cadastro_eirox_cacheado(caminho_str, assinatura, colunas_tuple):
+    caminho = Path(caminho_str)
+    colunas = list(colunas_tuple)
+    try:
         try:
             df = pd.read_csv(caminho, sep=";", dtype=str, encoding="utf-8-sig")
         except Exception:
@@ -2085,6 +2143,21 @@ def _ler_csv_cadastro_eirox(caminho, colunas):
         return pd.DataFrame(columns=colunas)
 
 
+def _ler_csv_cadastro_eirox(caminho, colunas):
+    try:
+        if not caminho.exists():
+            pd.DataFrame(columns=colunas).to_csv(
+                caminho, index=False, sep=";", encoding="utf-8-sig"
+            )
+        return _ler_csv_cadastro_eirox_cacheado(
+            str(caminho.resolve()),
+            _assinatura_arquivo_cadastro_eirox(caminho),
+            tuple(colunas),
+        ).copy(deep=False)
+    except Exception:
+        return pd.DataFrame(columns=colunas)
+
+
 def _salvar_csv_cadastro_eirox(df, caminho, colunas):
     try:
         df = df.copy()
@@ -2092,6 +2165,10 @@ def _salvar_csv_cadastro_eirox(df, caminho, colunas):
             if col not in df.columns:
                 df[col] = ""
         df[colunas].fillna("").to_csv(caminho, index=False, sep=";", encoding="utf-8-sig")
+        try:
+            _ler_csv_cadastro_eirox_cacheado.clear()
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -2171,7 +2248,7 @@ def cnpjs_principais_do_usuario():
             & cnpjs["Status"].astype(str).str.upper().str.strip().ne("INATIVO")
         ].copy()
 
-        cnpjs["CNPJ_Limpo"] = cnpjs["CNPJ"].apply(normalizar_cnpj_eirox)
+        cnpjs["CNPJ_Limpo"] = normalizar_cnpj_eirox_serie(cnpjs["CNPJ"])
         return {
             c for c in cnpjs["CNPJ_Limpo"].dropna().astype(str).str.strip().tolist()
             if c and c != "00000000000000"
@@ -2194,7 +2271,7 @@ def aplicar_classificacao_principal_concorrente(base, nome_base=""):
             return base
 
         principais = cnpjs_principais_do_usuario()
-        base["CNPJ_Limpo"] = base[col_cnpj].apply(normalizar_cnpj_eirox)
+        base["CNPJ_Limpo"] = normalizar_cnpj_eirox_serie(base[col_cnpj])
         base["Tipo_Estabelecimento"] = np.where(base["CNPJ_Limpo"].isin(principais), "Principal", "Concorrente")
         base.loc[base["CNPJ_Limpo"].astype(str).str.strip().eq(""), "Tipo_Estabelecimento"] = "Sem CNPJ"
         return base
@@ -3941,7 +4018,7 @@ def eirox_render_header_premium():
     st.markdown(
         f"""
         <div class="eirox-hero-premium">
-            <div class="eirox-hero-kicker">Eirox Pricing Enterprise</div>
+            <div class="eirox-hero-kicker">Intedados Pricing Enterprise</div>
             <h1 class="eirox-hero-title">Cockpit Executivo de Pricing</h1>
             <div class="eirox-hero-subtitle">
                 Cliente: <b>{cliente}</b> · Última atualização: <b>{agora}</b>
@@ -8051,7 +8128,7 @@ def eirox_menu_unico_sidebar(paginas_cliente, paginas_admin, plano_atual):
             st.markdown(
                 """
                 <div class="eirox-menu-kicker-v1422 eirox-admin-kicker-v1422">Área Administrativa</div>
-                <div class="eirox-menu-title-v1422">Gestão Eirox</div>
+                <div class="eirox-menu-title-v1422">Gestão Intedados</div>
                 <div class="eirox-menu-sub-v1422">Administração, segurança e operação</div>
                 """,
                 unsafe_allow_html=True,
@@ -8269,7 +8346,7 @@ def eirox_enriquecer_pipeline_municipio(df_pesquisa, compra_base, estoque_base, 
 
 
 # EIROX PRICING 2.0 — FASE 7: NAVEGAÇÃO, FILTROS E EXPORTAÇÃO GLOBAL.
-VERSAO_APP = "Enterprise 2.0 — Fase 8.19 — Unidade Numeral Forçada"
+VERSAO_APP = "Enterprise 2.0 — Fase 8.21 — Referência Única de Dados"
 
 # --------------------------------------------------
 # FORMATACAO BRASIL
@@ -11493,7 +11570,7 @@ def enviar_alerta_localizacao_capturada():
         ambiente = "Streamlit Cloud" if "/mount/src" in str(Path.cwd()) else "Localhost"
 
         mensagem = (
-            "📍 <b>Localização capturada no Eirox Pricing</b>\n\n"
+            "📍 <b>Localização capturada no Intedados Pricing</b>\n\n"
             f"👤 <b>Usuário:</b> {usuario}\n"
             f"🙋 <b>Nome:</b> {nome}\n"
             f"🔐 <b>Perfil:</b> {perfil}\n"
@@ -11527,7 +11604,7 @@ def registrar_alerta_login(usuario, nome, perfil):
         ambiente = "Streamlit Cloud" if "/mount/src" in str(Path.cwd()) else "Localhost"
 
         mensagem = (
-            "🚀 <b>Novo acesso no Eirox Pricing</b>\n\n"
+            "🚀 <b>Novo acesso no Intedados Pricing</b>\n\n"
             f"👤 <b>Usuário:</b> {usuario}\n"
             f"🙋 <b>Nome:</b> {nome}\n"
             f"🔐 <b>Perfil:</b> {perfil}\n"
@@ -11564,7 +11641,7 @@ def registrar_alerta_navegacao_async(pagina):
         ambiente = "Streamlit Cloud" if "/mount/src" in str(Path.cwd()) else "Localhost"
 
         mensagem = (
-            "🧭 <b>Navegação no Eirox Pricing</b>\n\n"
+            "🧭 <b>Navegação no Intedados Pricing</b>\n\n"
             f"👤 <b>Usuário:</b> {usuario}\n"
             f"🙋 <b>Nome:</b> {nome}\n"
             f"🔐 <b>Perfil:</b> {perfil}\n"
@@ -11870,7 +11947,7 @@ def gerar_backup_eirox(nome_manual=""):
 
         try:
             enviar_alerta_telegram(
-                "📦 <b>Backup gerado no Eirox Pricing</b>\\n\\n"
+                "📦 <b>Backup gerado no Intedados Pricing</b>\\n\\n"
                 f"📄 <b>Arquivo:</b> {zip_path.name}\\n"
                 f"📦 <b>Tamanho:</b> {_backup_tamanho_formatado(tamanho)}\\n"
                 f"✅ <b>Itens incluídos:</b> {len(itens_incluidos)}\\n"
@@ -12398,7 +12475,7 @@ DESCRICOES_TELAS_ENTERPRISE = {
     "🟢 Saúde do Sistema": "Monitoramento operacional do ambiente, performance, integridade das bases e integrações.",
     "📦 Backup Center": "Gerenciamento de backups, restauração e proteção das informações críticas do sistema.",
     "🏢 Multiempresa": "Administração de empresas, segregação de dados e preparação do ambiente SaaS.",
-    "📌 Sobre o Eirox": "Informações institucionais, propósito da plataforma e visão geral do produto.",
+    "📌 Sobre a Intedados": "Informações institucionais, propósito da plataforma e visão geral do produto.",
     "🧭 Roadmap do Produto": "Plano evolutivo da plataforma, módulos concluídos, próximos ciclos e prioridades.",
     "💼 Licenciamento Multiempresa": "Modelo comercial, planos de uso, governança de clientes e expansão SaaS.",
     "💼 Licenciamento Real": "Controle real de planos, expiração, limites de usuários, lojas e bloqueio de licença.",
@@ -14638,7 +14715,7 @@ TELAS_ADMIN_EIROX = [
     "💼 Licenciamento Real",
     "🏢 CRM Enterprise",
     "🏁 Release Candidate",
-    "📌 Sobre o Eirox",
+    "📌 Sobre a Intedados",
     "🧭 Roadmap do Produto",
     "🧪 Diagnóstico",
     "💳 Billing Enterprise"]
@@ -14746,7 +14823,7 @@ def filtrar_paginas_por_plano(paginas):
 
 def dividir_menu_cliente_admin(paginas):
     """
-    Separa menu em Área do Cliente e Administração Eirox.
+    Separa menu em Área do Cliente e Administração Intedados.
     """
 
     try:
@@ -15031,7 +15108,7 @@ def portal_novidades():
     return pd.DataFrame(
         [
             {"Versão": "v1.39.1", "Novidade": "Portal do Cliente Enterprise", "Descrição": "Minha empresa, licença, uso, suporte e central de conhecimento."},
-            {"Versão": "v1.38.1", "Novidade": "Menu por plano", "Descrição": "Área do Cliente separada da Administração Eirox."},
+            {"Versão": "v1.38.1", "Novidade": "Menu por plano", "Descrição": "Área do Cliente separada da Administração Intedados."},
             {"Versão": "v1.38.0", "Novidade": "CRM Enterprise", "Descrição": "Gestão comercial de clientes, planos, MRR e implantação."},
             {"Versão": "v1.37.1", "Novidade": "Workflow Comercial", "Descrição": "Aprovação e rejeição de recomendações da IA."},
             {"Versão": "v1.37.0", "Novidade": "IA Pricing Enterprise", "Descrição": "Recomendações automáticas de preço."},
@@ -16403,7 +16480,7 @@ def tela_login():
         st.markdown(
             """
             <div style="text-align:center; margin-top:2px; margin-bottom:12px;">
-                <h1 style="font-size:1.70rem;line-height:1.08;margin:0 0 7px 0;">Eirox Pricing</h1>
+                <h1 style="font-size:1.70rem;line-height:1.08;margin:0 0 7px 0;">Intedados Pricing</h1>
                 <div style="font-size:1.03rem;font-weight:400;color:#B7C7D8;line-height:1.2;">
                     Inteligência de Pricing para Drogarias
                 </div>
@@ -16586,7 +16663,7 @@ except:
 st.markdown(
     """
     <div class="eirox-hero" style="max-height:none !important;height:auto !important;overflow:visible !important;padding:10px 18px 11px 20px !important;margin-bottom:12px !important;">
-        <div class="eirox-section-title" style="font-size:0.68rem !important;line-height:1.05 !important;margin-bottom:5px !important;">Eirox Pricing Enterprise</div>
+        <div class="eirox-section-title" style="font-size:0.68rem !important;line-height:1.05 !important;margin-bottom:5px !important;">Intedados Pricing Enterprise</div>
         <h1 style="font-size:1.38rem !important;line-height:1.12 !important;margin:0 !important;padding:0 !important;">📊 Inteligência de Pricing & Competitividade</h1>
         <p style="font-size:0.80rem !important;line-height:1.2 !important;margin:5px 0 0 0 !important;">Monitoramento executivo de preços, concorrência, margem, alertas e oportunidades comerciais.</p>
     </div>
@@ -19528,14 +19605,24 @@ def eirox_v282_analise_prioritarios(prioridades, dados):
     out = eirox_v286_enriquecer_familia_prioritarios(out, dados)
     out["Curva"] = mapcol(["CURVA","Curva"], "")
 
-    # Preço atual — regra estrita V7.1
-    out["Preço Atual"] = pd.to_numeric(
-        mapcol(["Preço_Atual_Eirox","Preco_Atual_Oficial","Preco_Ultima_Venda"]),
-        errors="coerce"
-    )
-    fonte = mapcol(["Fonte_Preço_Eirox","Fonte_Preco_Oficial"], "").fillna("").astype(str)
+    # V8.28 — Preço Atual canônico também na Prioridade de Pesquisa.
+    _mapa_preco_v828 = eirox_v146_preco_principal()
+    if isinstance(_mapa_preco_v828, pd.DataFrame) and not _mapa_preco_v828.empty:
+        _mp_v828 = _mapa_preco_v828.copy()
+        _mp_v828["EAN"] = _ean(_mp_v828["EAN"])
+        _mp_v828 = _mp_v828.drop_duplicates("EAN", keep="last").set_index("EAN")
+        out["Preço Atual"] = pd.to_numeric(
+            keys.map(_mp_v828["Preco_Principal_Final"]), errors="coerce"
+        )
+        fonte = keys.map(_mp_v828["Fonte_Preco_Principal"]).fillna("").astype(str)
+    else:
+        out["Preço Atual"] = pd.to_numeric(
+            mapcol(["Preço_Atual_Eirox","Preco_Atual_Oficial","Preco_Ultima_Venda"]),
+            errors="coerce"
+        )
+        fonte = mapcol(["Fonte_Preço_Eirox","Fonte_Preco_Oficial"], "").fillna("").astype(str)
     out["Fonte Preço Atual"] = fonte.replace({
-        "ÚLTIMA VENDA": "ARQUIVO DIÁRIO — ÚLTIMA VENDA DO SISTEMA",
+        "ÚLTIMA VENDA": "ARQUIVO DIÁRIO — TOTAL / QUANTIDADE DA ÚLTIMA VENDA",
         "ÚLTIMO MÊS FECHADO": "VENDA_FINAL_TESTE — ÚLTIMO MÊS FECHADO",
     })
 
@@ -20048,7 +20135,19 @@ def eirox_v288_tabela_prioritarios_padrao_subir(prioridades, dados):
         default="ℹ️ REVISAR"
     )
 
-    pa = pd.to_numeric(m.get("Preço_Atual_Eirox", np.nan), errors="coerce")
+    # V8.28 — barreira visual canônica na tabela da Prioridade.
+    _mapa_v828 = eirox_v146_preco_principal()
+    if isinstance(_mapa_v828, pd.DataFrame) and not _mapa_v828.empty:
+        _mv828 = _mapa_v828.copy()
+        _mv828["EAN"] = _ean(_mv828["EAN"])
+        _mv828 = _mv828.drop_duplicates("EAN", keep="last").set_index("EAN")
+        pa = pd.to_numeric(
+            m["__EAN_V288"].map(_mv828["Preco_Principal_Final"]),
+            errors="coerce"
+        )
+    else:
+        pa = pd.to_numeric(m.get("Preço_Atual_Eirox", np.nan), errors="coerce")
+
     pref = pd.to_numeric(m.get("Preço_Base_Calculo_Eirox", np.nan), errors="coerce")
     pm = pd.to_numeric(m.get("Preço_Mercado_Eirox", np.nan), errors="coerce")
     ps = pd.to_numeric(m.get("Preço_Sugerido_Eirox", np.nan), errors="coerce")
@@ -20500,7 +20599,7 @@ if usuario_pode_ver_multiempresa() and "🏢 Multiempresa" not in paginas_libera
 
 if usuario_pode_ver_multiempresa():
     for pagina_enterprise in [
-        "📌 Sobre o Eirox",
+        "📌 Sobre a Intedados",
         "🧭 Roadmap do Produto",
         "💼 Licenciamento Multiempresa",
         "💼 Licenciamento Real",
@@ -20801,6 +20900,83 @@ busca = st.sidebar.text_input(
     "Produto ou EAN",
     key="eirox_v270_filtro_busca",
 )
+
+
+# ==========================================================
+# V8.28 — BARREIRA GLOBAL DO PREÇO ATUAL
+# ==========================================================
+def eirox_v828_overlay_preco_canonico_master(base):
+    """
+    Sobrescreve em memória todos os aliases conhecidos de Preço Atual usando
+    a fonte canônica V8.27. Isto evita que snapshots antigos, enriquecimentos
+    legados ou telas específicas voltem a exibir preço de tabela.
+
+    Não altera arquivos físicos nem bases de origem.
+    """
+    if not isinstance(base, pd.DataFrame) or base.empty:
+        return base
+
+    out = base.copy()
+    ce = _col(out, ["EAN", "EAN (GTIN)", "GTIN", "Código de Barras"])
+    if not ce:
+        return out
+
+    mapa = eirox_v146_preco_principal()
+    if not isinstance(mapa, pd.DataFrame) or mapa.empty:
+        return out
+
+    mp = mapa.copy()
+    mp["EAN"] = _ean(mp["EAN"])
+    mp = mp[mp["EAN"].ne("")].drop_duplicates("EAN", keep="last").set_index("EAN")
+
+    keys = _ean(out[ce])
+    preco = pd.to_numeric(keys.map(mp["Preco_Principal_Final"]), errors="coerce")
+    fonte = keys.map(mp["Fonte_Preco_Principal"]).fillna("SEM PREÇO")
+    data = keys.map(mp["Data_Ultima_Venda"])
+    loja = (
+        keys.map(mp["Loja_Ultima_Venda"])
+        if "Loja_Ultima_Venda" in mp.columns
+        else pd.Series("", index=out.index)
+    )
+    vendaid = (
+        keys.map(mp["VendaID_Ultima_Venda"])
+        if "VendaID_Ultima_Venda" in mp.columns
+        else pd.Series(np.nan, index=out.index)
+    )
+    arquivo = (
+        keys.map(mp["Arquivo_Ultima_Venda"])
+        if "Arquivo_Ultima_Venda" in mp.columns
+        else pd.Series("", index=out.index)
+    )
+
+    # Todos estes campos passam a carregar a MESMA verdade numérica.
+    for coluna in [
+        "Preco_Ultima_Venda",
+        "Preco_Atual",
+        "Preco_Atual_Venda",
+        "Preço Atual",
+        "Preço_Atual",
+        "Preço_Atual_Eirox",
+        "Preco_Atual_Oficial",
+    ]:
+        if coluna in out.columns or coluna in {
+            "Preco_Ultima_Venda", "Preco_Atual", "Preco_Atual_Venda"
+        }:
+            out[coluna] = preco
+
+    out["Data_Ultima_Venda"] = pd.to_datetime(data, errors="coerce")
+    out["Loja_Ultima_Venda"] = loja.fillna("").astype(str)
+    out["VendaID_Ultima_Venda"] = pd.to_numeric(vendaid, errors="coerce")
+    out["Arquivo_Ultima_Venda"] = arquivo.fillna("").astype(str)
+    out["Fonte_Preço_Eirox"] = fonte
+    if "Fonte_Preco_Oficial" in out.columns:
+        out["Fonte_Preco_Oficial"] = fonte
+
+    return out
+
+
+# V8.28 — mesmo preço canônico em TODAS as telas antes de qualquer filtro.
+df = eirox_v828_overlay_preco_canonico_master(df)
 
 # --------------------------------------------------
 # FILTRAR
@@ -23889,7 +24065,7 @@ def eirox_v271_aplicar_preco_canonico_tabela(tab):
         ]
 
     out["Fonte Preço Atual"] = fonte.map({
-        "ÚLTIMA VENDA": "ARQUIVO DIÁRIO — ÚLTIMA VENDA DO SISTEMA",
+        "ÚLTIMA VENDA": "ARQUIVO DIÁRIO — TOTAL / QUANTIDADE DA ÚLTIMA VENDA",
         "ÚLTIMO MÊS FECHADO": "VENDA_FINAL_TESTE — ÚLTIMO MÊS FECHADO",
         "SEM PREÇO": "SEM PREÇO",
     }).fillna("SEM PREÇO")
@@ -26068,9 +26244,9 @@ if pagina == "👥 Controle de Usuários":
 # SOBRE O EIROX ENTERPRISE
 # --------------------------------------------------
 
-if pagina == "📌 Sobre o Eirox":
+if pagina == "📌 Sobre a Intedados":
 
-    mostrar_explicacao_visao_eirox("📌 Sobre o Eirox")
+    mostrar_explicacao_visao_eirox("📌 Sobre a Intedados")
 
     if not usuario_pode_ver_multiempresa():
         st.error("Acesso não autorizado.")
@@ -26079,14 +26255,14 @@ if pagina == "📌 Sobre o Eirox":
     st.markdown(
         """
         <div class="eirox-hero">
-            <div class="eirox-section-title">Eirox Pricing Enterprise</div>
-            <h1>📌 Sobre o Eirox Enterprise</h1>
+            <div class="eirox-section-title">Intedados Pricing Enterprise</div>
+            <h1>📌 Sobre a Intedados Enterprise</h1>
             <p>Plataforma de inteligência de pricing, competitividade e governança para redes de farmácia.</p>
         """,
         unsafe_allow_html=True
     )
 
-    legenda_tela("📌 Sobre o Eirox")
+    legenda_tela("📌 Sobre a Intedados")
 
     c1, c2, c3 = st.columns(3)
 
@@ -33232,7 +33408,7 @@ st.markdown(
 st.markdown(
     f"""
     <section class="eirox-dash-hero-v1420">
-      <div class="eirox-dash-eyebrow-v1420">Eirox Pricing Enterprise · Visão Executiva</div>
+      <div class="eirox-dash-eyebrow-v1420">Intedados Pricing Enterprise · Visão Executiva</div>
       <h1 class="eirox-dash-title-v1420">Dashboard Geral</h1>
       <div class="eirox-dash-sub-v1420">
         Inteligência de pricing, competitividade e rentabilidade em uma visão única para apresentação e decisão executiva.
@@ -37476,5 +37652,79 @@ div[data-testid="element-container"]:has(div[data-testid="stImage"]) {
     padding-top: 0 !important;
     padding-bottom: 0 !important;
 }
+</style>
+""", unsafe_allow_html=True)
+
+# ============================================================
+# INTEDADOS — IDENTIDADE VISUAL GLOBAL
+# Camada final de marca. Não altera regras de negócio.
+# Paleta derivada da logo oficial Intedados.
+# ============================================================
+st.markdown("""
+<style id="intedados-brand-global">
+:root {
+  --if-cyan:#00C6FF;
+  --if-blue:#0066FF;
+  --if-violet:#7B2CFF;
+  --if-purple:#B64DFF;
+  --if-bg:#050817;
+  --if-panel:#0B1230;
+  --if-panel2:#111A3D;
+  --if-text:#F7FAFF;
+  --if-muted:#AAB9D8;
+  --if-border:rgba(73,122,255,.28);
+}
+html, body, [data-testid="stAppViewContainer"], .stApp {
+  background:
+    radial-gradient(circle at 86% 6%, rgba(0,198,255,.10), transparent 28%),
+    radial-gradient(circle at 72% 92%, rgba(123,44,255,.10), transparent 30%),
+    linear-gradient(180deg,#050817 0%,#070D20 48%,#080B1B 100%) !important;
+  color:var(--if-text) !important;
+}
+section[data-testid="stSidebar"] {
+  background:
+    radial-gradient(circle at 50% 0%,rgba(0,198,255,.13),transparent 24%),
+    linear-gradient(180deg,#0B1636 0%,#090D25 56%,#070919 100%) !important;
+  border-right:1px solid rgba(74,103,255,.30) !important;
+}
+div[data-testid="stMetric"] {
+  background:linear-gradient(145deg,rgba(16,27,67,.97),rgba(8,14,38,.98)) !important;
+  border:1px solid var(--if-border) !important;
+  box-shadow:0 14px 32px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.025) !important;
+}
+div[data-testid="stMetric"]::before {
+  background:linear-gradient(90deg,var(--if-cyan),var(--if-blue) 48%,var(--if-violet),var(--if-purple)) !important;
+}
+.stButton > button, .stDownloadButton > button {
+  border-color:rgba(0,198,255,.40) !important;
+  background:linear-gradient(135deg,rgba(0,102,255,.16),rgba(123,44,255,.13)) !important;
+}
+.stButton > button:hover, .stDownloadButton > button:hover {
+  border-color:var(--if-cyan) !important;
+  box-shadow:0 0 20px rgba(0,198,255,.12) !important;
+}
+div[data-baseweb="select"] > div,
+div[data-testid="stTextInput"] input,
+div[data-testid="stNumberInput"] input {
+  background:#090F29 !important;
+  border-color:rgba(78,117,255,.30) !important;
+}
+[data-testid="stDataFrame"], [data-testid="stTable"], div[data-testid="stPlotlyChart"], div[data-testid="stExpander"] {
+  border-color:rgba(73,122,255,.24) !important;
+  background:linear-gradient(145deg,rgba(12,22,55,.92),rgba(7,12,31,.96)) !important;
+}
+a, [data-testid="stMarkdownContainer"] a { color:#45D8FF !important; }
+.eirox-dash-hero-v1420, .eirox-hero, .hero-eirox, .hero-pricing {
+  border-color:rgba(73,122,255,.30) !important;
+  background:
+    radial-gradient(circle at 92% 12%,rgba(0,198,255,.13),transparent 32%),
+    radial-gradient(circle at 68% 105%,rgba(123,44,255,.15),transparent 35%),
+    linear-gradient(135deg,rgba(12,22,57,.98),rgba(6,10,28,.98)) !important;
+}
+.eirox-dash-hero-v1420::before {
+  background:linear-gradient(180deg,var(--if-cyan),var(--if-blue) 42%,var(--if-violet),var(--if-purple)) !important;
+}
+.eirox-dash-eyebrow-v1420, .eirox-section-title, .eirox-hero-kicker { color:#45D8FF !important; }
+/* A logo continua governada pelo Brand System centralizado existente. */
 </style>
 """, unsafe_allow_html=True)
